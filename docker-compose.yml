@@ -1,0 +1,25 @@
+services:
+  tunester:
+    build: .
+    image: tunester:latest
+    container_name: tunester
+    restart: unless-stopped
+    ports:
+      - "8102:8102"
+    volumes:
+      - ./downloads:/data
+      - /home/user/projects/ytcookies/data:/shared-cookies
+      - .env:/app/.env:ro
+      - ./wireguard/wg0.conf.template:/etc/wireguard/wg0.conf.template:ro
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true
