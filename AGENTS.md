@@ -35,13 +35,17 @@ reject).
 
 - **AcoustID content gate** (`_acoustid_identify`, needs
   `TUNESTER_ACOUSTID_KEY`; fpcalc = `libchromaprint-tools`): fingerprints the
-  download (chromaprint) and looks it up on AcoustID. A confident
-  identification (best result score ≥ `TUNESTER_ACOUSTID_MIN_CONF`, default
-  70) of a DIFFERENT artist/track rejects with gate `acoustid`; a match is a
-  strong pass. This is the ONLY gate that catches a mislabeled article — a
-  file named/tagged "Loser" that contains a different song of the right
-  length passes every name/duration/LLM gate (see the Beck "Loser" 2026-09-28
-  pitfall below). Silently skipped when the key or fpcalc is absent.
+  download (chromaprint) and looks it up on AcoustID via the **v2 API**
+  (`POST https://api.acoustid.org/v2/lookup`, param `client`, `meta=recordings`;
+  the legacy `acoustid.org/api/1/` endpoint is gone - 404). Confidence is the
+  result `score` on a **0..1** scale; the best result's top recording
+  (`results[0].recordings[0]` = artist+title) that is NOT the target rejects
+  with gate `acoustid` when score ≥ `TUNESTER_ACOUSTID_MIN_CONF` (default
+  **0.7**), a match is a strong pass. This is the ONLY gate that catches a
+  mislabeled article — a file named/tagged "Loser" that contains a different
+  song of the right length passes every name/duration/LLM gate (see the Beck
+  "Loser" 2026-09-28 pitfall below). Silently skipped when the key or fpcalc
+  is absent. Key = the user's API key from acoustid.org (set in `.env`).
 - The LLM is NOT trusted with duration: pretests showed it fabricates a
   matching studio length and rationalizes the input (said "matches ~2:56"
   for a 175 s file and "~3:38" for a 231 s file of the same song).

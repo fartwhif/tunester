@@ -38,13 +38,14 @@ TRIALS_PER_SOURCE = int(os.environ.get("TUNESTER_TRIALS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("TUNESTER_DOWNLOAD_TIMEOUT", "900"))
 
 # Optional audio-content gate (needs TUNESTER_ACOUSTID_KEY): fingerprint the
-# download with chromaprint and look it up on AcoustID; a confident
-# identification that is NOT the target song rejects the file - mislabeled
-# articles (a "Loser" file containing a different track) pass every
-# name/duration/LLM gate, so the content itself is checked.
+# download with chromaprint and look it up on AcoustID (v2 API,
+# api.acoustid.org/v2/lookup); a confident identification that is NOT the
+# target song rejects the file - mislabeled articles (a "Loser" file
+# containing a different track) pass every name/duration/LLM gate, so the
+# content itself is checked. Confidence is 0..1 (v2 scale).
 ACOUSTID_KEY = os.environ.get("TUNESTER_ACOUSTID_KEY", "")
-ACOUSTID_HOST = os.environ.get("TUNESTER_ACOUSTID_HOST", "acoustid.org")
-ACOUSTID_MIN_CONF = float(os.environ.get("TUNESTER_ACOUSTID_MIN_CONF", "70"))
+ACOUSTID_HOST = os.environ.get("TUNESTER_ACOUSTID_HOST", "api.acoustid.org")
+ACOUSTID_MIN_CONF = float(os.environ.get("TUNESTER_ACOUSTID_MIN_CONF", "0.7"))
 
 COOKIES_CANDIDATES = [
     Path("/shared-cookies/cookies.txt"),                    # container shared mount
@@ -887,24 +888,36 @@ def _consensus_duration(artist: str, title: str) -> float | None:
 
 
 def _acoustid_identify(path: Path) -> tuple[str, str, float] | None:
-    """Fingerprint `path` (chromaprint) and look it up on AcoustID.
-    Returns (artist, title, confidence) for the best match, or None when
-    no key is set, fpcalc is missing, or the service fails."""
+    """Fingerprint `path` (chromaprint) and look it up on AcoustID (v2).
+    Returns (artist, title, confidence 0..1) for the best match, or None
+    when no key is set, fpcalc is missing, or the service fails."""
     if not ACOUSTID_KEY or not shutil.which("fpcalc"):
         return None
     try:
-        proc = subprocess.run(["fpcalc", "--json", str(path)],
+        proc = subprocess.run(["fpcalc", str(path)],
                               capture_output=True, timeout=300)
         if proc.returncode != 0:
             return None
-        j = json.loads(proc.stdout)
-        fp, dur = j["fingerprint"], int(j["duration"])
-    except (OSError, ValueError, KeyError):
+        # fpcalc prints "FINGERPRINT=..." / "DURATION=..." text lines
+        kv = {}
+        for line in (proc.stdout or b"").decode(errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip()
+        fp, dur = kv.get("FINGERPRINT", ""), int(kv.get("DURATION", "0"))
+        if not fp or dur <= 0:
+            return None
+    except (OSError, ValueError):
         return None
-    url = (f"https://{ACOUSTID_HOST}/api/1/?clientkey={ACOUSTID_KEY}"
-           f"&fingerprint={fp}&duration={dur}&meta=tracks&format=json")
+    body = urllib.parse.urlencode({
+        "client": ACOUSTID_KEY, "fingerprint": fp, "duration": str(dur),
+        "meta": "recordings", "format": "json"})
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+        req = urllib.request.Request(
+            f"https://{ACOUSTID_HOST}/v2/lookup",
+            data=body.encode("utf-8"),
+            headers={"User-Agent": BROWSER_UA,
+                     "Content-Type": "application/x-www-form-urlencoded"})
         with urllib.request.urlopen(req, timeout=30) as r:
             d = json.load(r)
     except Exception:
@@ -914,11 +927,16 @@ def _acoustid_identify(path: Path) -> tuple[str, str, float] | None:
         return None
     top = results[0]
     conf = float(top.get("score") or 0.0)
-    tracks = top.get("tracks") or []
-    if not tracks:
+    recs = top.get("recordings") or []
+    if not recs:
         return None
-    return (str(tracks[0].get("artist") or ""),
-            str(tracks[0].get("recording") or ""), conf)
+    rec = recs[0]
+    artists = rec.get("artists") or []
+    artist = str(artists[0].get("name") or "") if artists else ""
+    title = str(rec.get("title") or "")
+    if not title:
+        return None
+    return artist, title, conf
 
 
 def _acoustid_matches(artist: str, title: str, target: Target) -> bool:
@@ -965,12 +983,12 @@ def verify_download(path: Path, cand: Candidate, target: Target,
             if not _acoustid_matches(id_artist, id_title, target):
                 return False, "acoustid", (
                     f"fingerprint identifies as {id_artist} - {id_title} "
-                    f"(conf {conf:.0f})")
+                    f"(conf {conf * 100:.0f}%)")
             log(f"        acoustid: {id_artist} - {id_title} "
-                f"(conf {conf:.0f}) - matches target")
+                f"(conf {conf * 100:.0f}%) - matches target")
         else:
-            log(f"        acoustid: best conf {conf:.0f} < "
-                f"{ACOUSTID_MIN_CONF:.0f} - gate skipped")
+            log(f"        acoustid: best conf {conf * 100:.0f}% < "
+                f"{ACOUSTID_MIN_CONF * 100:.0f}% - gate skipped")
 
     if not (use_llm and llm):
         return True, "filter-only", ""
