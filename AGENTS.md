@@ -30,7 +30,18 @@ orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
 
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
-LLM version gate (clean/radio → reject).
+**AcoustID content gate** (optional) → LLM version gate (clean/radio →
+reject).
+
+- **AcoustID content gate** (`_acoustid_identify`, needs
+  `TUNESTER_ACOUSTID_KEY`; fpcalc = `libchromaprint-tools`): fingerprints the
+  download (chromaprint) and looks it up on AcoustID. A confident
+  identification (best result score ≥ `TUNESTER_ACOUSTID_MIN_CONF`, default
+  70) of a DIFFERENT artist/track rejects with gate `acoustid`; a match is a
+  strong pass. This is the ONLY gate that catches a mislabeled article — a
+  file named/tagged "Loser" that contains a different song of the right
+  length passes every name/duration/LLM gate (see the Beck "Loser" 2026-09-28
+  pitfall below). Silently skipped when the key or fpcalc is absent.
 - The LLM is NOT trusted with duration: pretests showed it fabricates a
   matching studio length and rationalizes the input (said "matches ~2:56"
   for a 175 s file and "~3:38" for a 231 s file of the same song).
@@ -63,6 +74,12 @@ Release names are untrustworthy — selection is by **per-file** names:
   pack vs a 2001 target; 2005 single pressings of the same studio cut
   pass); year-less titles always pass.
 - `TRIALS_PER_SOURCE` default 5 (env `TUNESTER_TRIALS`).
+- **Age preference**: nzb candidates carry the release post timestamp
+  (`Candidate.posted`, from the feed `<pubDate>`); `pick` sorts
+  `(score, popularity, -posted)` so, all else equal, OLD established releases
+  outrank fresh uploads - new uploads' names/tags have proven unreliable
+  (2015/2025/2026 "Mellow Gold" re-uploads vs the 2011-2013 rips). The
+  album-pluck `_rank` uses the same oldest-first tiebreak.
 - `search_candidates(..., year=, album=)`: nzb query appends the year
   (free-text relevance hint; pushes original pressings to the top of
   nzb.life results). nzb.life ANDs free text, so if no release title
@@ -73,7 +90,8 @@ Release names are untrustworthy — selection is by **per-file** names:
 ## Album pluck (nzb)
 `discover` returns the original album and the MusicBrainz duration
 anchor. The `artist + album + year` nzb search runs for every nzb target:
-candidates are ranked (album in title, year in title) and up to 10 are
+candidates are ranked (album in title, year in title, then oldest first)
+and up to 10 are
 NZB-checked (cache-first `_nzb_manifest`); the first release whose file
 list contains a clean file with the song title becomes the pluck
 candidate and is **tried before** direct search hits — the original
@@ -96,6 +114,33 @@ Early-return on the first verified release caps quota spend.
   2014 content, so the pluck must check past the top ranks (cap 10) and
   judge manifests, never titles. Countermeasures: per-file manifest
   checks, `_year_mismatch`, per-file selection.
+- **Beck "Loser" (2026-09-28): names, ID3, AND duration ALL lie.** A file
+  `a1-beck-loser_(lp_version).flac` (ID3 "Loser", 236.7 s = the MusicBrainz
+  anchor) was a completely different song. Normalized FFT cross-correlation
+  showed the VLS a1, the archive.org "beck-loser" upload, and the Mellow
+  Gold rips' "01 - Loser" were THREE distinct songs (pairwise ~0.02). On
+  nzb.life EVERY "Beck Mellow Gold" release (2011 EOS, 2013 WRS, 2013
+  FORSAKEN carrying the real DGCD-24634 catalog number, 2015, 2025) is the
+  SAME mislabeled early-Beck demo compilation (Loser + "Pay No Mind
+  (Snoozer)" + "Whiskeyclone (Hotel City 1997)" + …); the genuine Mellow
+  Gold album (Loser, Sexx Laws, New Pollution, …) is NOT in its catalog. Its
+  track 1 "Loser" (235.0 s, par2-verified FORSAKEN CD-FLAC) is the
+  canonical one - identical (0.983) across the 2011/2013/2015 re-uploads.
+  The official YT video (YgSPaXgAdzE) is bot-blocked from this IP even with
+  the shared cookies (player formats withheld), so it is not a usable
+  reference/source. When a source's whole catalog is one mislabeled disc,
+  only content verification (AcoustID) + oldest-first ranking help.
+- **LLM discover is nondeterministic about `album`** (2026-09-28): for
+  "Beck - Loser (1993)" it sometimes returns album="" - then the album
+  pluck silently never runs and the fallback direct search plucks the VLS
+  12" a1 (the different song). `discover` now backfills an empty album via
+  `musicbrainz_album`: the MB search API is itself nondeterministic and
+  has no release-group types, so it tallies release titles across every
+  exact-title recording and picks the MOST-PRESSED title (the original
+  album has worldwide reissues; one-off compilations/promos appear once),
+  excluding titles equal to the song (the single = the 12" false front),
+  preferring a +/-1-year window when the year is known. Beck -> Mellow
+  Gold; Sledgehammer/Big Time -> So; One Step Closer -> Hybrid Theory.
 
 - All LLM prompts (system + user) are appended to the status ticker via
   `LLM(log=...)` inside `chat()` — single choke point; both the discover
@@ -104,6 +149,17 @@ Early-return on the first verified release caps quota spend.
 ## Video fallback (nzb)
 Audio files always beat video files within a release; video containers
 (mkv/mp4/…) are fetched and transcoded audio-only (`-vn`), then QC'd.
+
+## Archive (RAR/zip) releases (nzb)
+When a release has NO bare audio/video file, `_nzb_archive_pluck` fetches the
+WHOLE set over NNTP (cap `TUNESTER_NZB_MAX_ARCHIVE_MB`, default 1024 MB),
+verifies/repairs with `par2` when a `.par2` is present, extracts with `unar`
+(primary volume: `.part1.rar` > plain `.rar` > first), then plucks the track
+from the extracted tree with the same title-hit/format/size ranking as the
+bare-file path. Image ships `unar`, `p7zip-full`, `par2`,
+`libchromaprint-tools`. Scene RAR volume naming varies (FORSAKEN's rip = one
+`.rar` + `.r00…` siblings), so ALL files are fetched, not just `*.rar` —
+`unar` resolves sibling volumes from the working directory.
 
 ## Deploy (any code change)
 ```
@@ -145,7 +201,10 @@ the last fallback keeps `LOAD_WAIT`=360 s cold-start wait.
   (no HAA), so album pluck failed and the pipeline fell back to the
   direct search, plucking the standard version from the 2005 CD.
   (Earlier guess that the studio cut was ~3:30/210 s was WRONG.)
-- Beck – Loser (1993): 235.7 s studio, plucked from
-  "Beck-Mellow Gold 1994 Lossless Flac" (`01 - Loser.flac`). Replaces the
-  earlier wrong delivery (269.7 s "Fume", mis-tagged B-side). MusicBrainz
-  year-dated anchor 235 s matched.
+- Beck – Loser (1993): 235.1 s, 160 k CBR (2026-09-28) — track 1 "Loser"
+  of the early-Beck compilation that EVERY nzb.life "Mellow Gold" release
+  actually is; par2-verified FORSAKEN CD-FLAC rip (real DGCD-24634 catalog
+  no.), cross-correlation-verified (0.983) identical across the 2011 EOS /
+  2013 WRS / 2015 re-uploads. Replaces two earlier WRONG deliveries (269.7 s
+  "Fume" mis-tagged B-side; then the 236.7 s VLS a1 — a different song that
+  passed every name/duration/LLM gate). See the 2026-09-28 curation pitfall.

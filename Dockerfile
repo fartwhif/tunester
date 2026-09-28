@@ -7,6 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     wireguard \
     iproute2 \
+    libchromaprint-tools \
+    unar \
+    p7zip-full \
+    par2 \
     && curl -sL -o /usr/local/bin/yt-dlp \
         https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
     && chmod +x /usr/local/bin/yt-dlp \

@@ -15,6 +15,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,6 +103,7 @@ class Candidate:
     duration: float | None = None
     popularity: int = 0
     score: int = 0
+    posted: float = 0.0  # release post timestamp (nzb.pubDate); 0 = unknown
 
 
 def _words(text: str) -> list[str]:
@@ -327,11 +329,19 @@ def _nzb_query(q: str) -> list[Candidate]:
         gm = re.search(r"details/([0-9a-fA-F]+)", item)
         if not tm or not gm:
             continue
+        pm = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+        posted = 0.0
+        if pm:
+            try:
+                posted = parsedate_to_datetime(pm.group(1).strip()).timestamp()
+            except (TypeError, ValueError):
+                pass
         cands.append(Candidate(
             source="nzb",
             url=gm.group(1),
             title=html.unescape(tm.group(1).strip()),
             uploader="usenet",
+            posted=posted,
         ))
     return cands
 
@@ -357,7 +367,11 @@ def search_candidates(source: Source, artist: str, title: str,
 
 
 def pick(cands: list[Candidate], artist: str, title: str) -> list[Candidate]:
-    """Filter out censored/altered/foreign titles; rank best to worst."""
+    """Filter out censored/altered/foreign titles; rank best to worst.
+
+    Ties break oldest-first: established usenet releases posted years ago
+    are far more likely to be the genuine article than fresh uploads,
+    whose file names and tags have proven unreliable."""
     bad = make_bad_filter(artist)
     usable = []
     for c in cands:
@@ -368,4 +382,5 @@ def pick(cands: list[Candidate], artist: str, title: str) -> list[Candidate]:
         if c.source == "scsearch" and c.duration is not None and c.duration <= 30:
             continue
         usable.append(c)
-    return sorted(usable, key=lambda c: (c.score, c.popularity), reverse=True)
+    return sorted(usable, key=lambda c: (c.score, c.popularity, -c.posted),
+                  reverse=True)

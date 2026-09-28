@@ -3,8 +3,8 @@
 Stages:
   1. discover   LLM (or heuristic) resolves the dirty name to artist/title/year
   2. search     sources best-to-worst, censored/altered uploads filtered out
-  3. verify     ffprobe sanity + LLM gate that the download is the original
-                uncensored studio recording
+  3. verify     ffprobe sanity + optional AcoustID content check + LLM gate
+                that the download is the original uncensored studio recording
   4. transcode  ffmpeg -> MP3 160 kbps CBR / 44.1 kHz / stereo
   5. name       "ARTIST - TITLE (YEAR).mp3", output re-verified against spec
 """
@@ -29,13 +29,22 @@ from sources import (BROWSER_UA, HTTP_TIMEOUT, NNTP_HOST, NNTP_PASS,
                      NNTP_PORT, NNTP_USER, NZB_API, NZB_APIKEY, NZB_I,
                      SOURCES, YTDLP, Candidate, _norm, _nzb_get,
                      browser_user_agent, make_bad_filter, nzb_configured,
-                     pick, search_candidates)
+                     pick, search_candidates, title_present)
 
 FFMPEG = os.environ.get("TUNESTER_FFMPEG", "ffmpeg")
 FFPROBE = os.environ.get("TUNESTER_FFPROBE", "ffprobe")
 OUTDIR_DEFAULT = Path(os.environ.get("TUNESTER_OUTDIR") or Path.cwd() / "downloads")
 TRIALS_PER_SOURCE = int(os.environ.get("TUNESTER_TRIALS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("TUNESTER_DOWNLOAD_TIMEOUT", "900"))
+
+# Optional audio-content gate (needs TUNESTER_ACOUSTID_KEY): fingerprint the
+# download with chromaprint and look it up on AcoustID; a confident
+# identification that is NOT the target song rejects the file - mislabeled
+# articles (a "Loser" file containing a different track) pass every
+# name/duration/LLM gate, so the content itself is checked.
+ACOUSTID_KEY = os.environ.get("TUNESTER_ACOUSTID_KEY", "")
+ACOUSTID_HOST = os.environ.get("TUNESTER_ACOUSTID_HOST", "acoustid.org")
+ACOUSTID_MIN_CONF = float(os.environ.get("TUNESTER_ACOUSTID_MIN_CONF", "70"))
 
 COOKIES_CANDIDATES = [
     Path("/shared-cookies/cookies.txt"),                    # container shared mount
@@ -146,6 +155,8 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
             raise TuneError("cannot parse 'Artist - Title' without the LLM; "
                             "rerun without --no-llm")
         artist, title, album = m.group(1).strip(), m.group(2).strip(), ""
+    if not album:
+        album = musicbrainz_album(artist, title, year, log)
     target = Target(artist, title, year, album)
     target.mb_duration = musicbrainz_duration(artist, title, year, log)
     if target.mb_duration:
@@ -246,6 +257,60 @@ def musicbrainz_duration(artist: str, title: str, year: str,
                 return m
         return 0.0
     return _cluster_median([L for _, L in dated])
+
+
+def musicbrainz_album(artist: str, title: str, year: str = "",
+                      log=print) -> str:
+    """Original album name from MusicBrainz, "" when unknown.
+
+    The search API is nondeterministic about which recordings it returns
+    and never reports release-group types, so selection is by a robust
+    signal instead: the original album has BY FAR the most pressings in
+    MB (worldwide reissues), while one-off compilations, radio promos
+    and live bootlegs appear once or twice. Tally release titles across
+    every exact-title recording match; releases titled exactly like the
+    song are the single (whose 12" rips are the classic nzb false front -
+    the VLS "Loser") and are excluded. With a known year, titles with a
+    pressing dated within +/-1 of it are preferred (the album's own era -
+    otherwise a later greatest-hits can out-press the original); the
+    most-pressed title wins, ties by earliest date."""
+    q = urllib.parse.urlencode({
+        "query": f'recording:"{title}" AND artist:"{artist}"',
+        "fmt": "json", "limit": 100})
+    data = _mb_get(f"/recording?{q}", log)
+    if not data:
+        return ""
+    a, t = _norm(artist), _norm(title)
+    display: dict[str, str] = {}   # norm title -> first-seen surface form
+    earliest: dict[str, str] = {}  # norm title -> earliest date
+    counts: dict[str, int] = {}    # norm title -> pressing count
+    window: dict[str, int] = {}    # norm title -> pressings within year +/-1
+    for r in data.get("recordings", []):
+        if _norm(str(r.get("title") or "")) != t:
+            continue
+        ac = _norm(" ".join(x.get("name", "") for x in r.get("artist-credit", [])))
+        if not (a in ac or ac in a):
+            continue
+        for rel in r.get("releases", []):
+            rt = str(rel.get("title") or "").strip()
+            if not rt:
+                continue
+            n = _norm(rt)
+            if n == t:
+                continue
+            display.setdefault(n, rt)
+            counts[n] = counts.get(n, 0) + 1
+            d = str(rel.get("date") or "")
+            if d and (n not in earliest or d < earliest[n]):
+                earliest[n] = d
+            if year and re.match(r"\d{4}", d) \
+                    and abs(int(d[:4]) - int(year)) <= 1:
+                window[n] = window.get(n, 0) + 1
+    if not counts:
+        return ""
+    keys = window.keys() if (year and window) else counts.keys()
+    best = min(keys, key=lambda n: (-counts[n], earliest.get(n, "9999")))
+    return display[best]
 
 
 def probe(path: Path) -> dict | None:
@@ -373,6 +438,13 @@ NZB_AUDIO_EXTS = ("flac", "wav", "aiff", "aif", "mp3", "ogg", "m4a")
 # Video containers whose audio track can be the studio recording (e.g. DDC
 # music-video releases); only used when the release has no pure-audio file.
 NZB_VIDEO_EXTS = ("mkv", "mp4", "m4v", "mov", "avi", "wmv", "flv", "webm")
+
+# Archive containers that may wrap the media files (whole-release RAR/zip
+# rips). When a release has no bare media file but has one of these, the
+# whole set is fetched, par2-verified, extracted, and the track plucked.
+NZB_ARCHIVE_EXTS = ("rar", "zip", "7z", "tar", "gz", "bz2", "xz", "tgz")
+NZB_MAX_ARCHIVE = (int(os.environ.get("TUNESTER_NZB_MAX_ARCHIVE_MB", "1024"))
+                   * 1024 * 1024)
 
 
 def _nzb_file_name(subject: str) -> str:
@@ -537,7 +609,8 @@ def _nzb_album_cands(target: Target, seen: set[str],
     def _rank(c):
         t = c.title.lower()
         return (target.album.lower() in t,
-                bool(target.year) and target.year in c.title)
+                bool(target.year) and target.year in c.title,
+                -c.posted)
     cands = sorted(cands, key=_rank, reverse=True)
     checked = 0
     for c in cands:
@@ -593,8 +666,7 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
             video.append((name, ext, grp, segs))
     pool = audio or video
     if not pool:
-        log("        no audio file in release")
-        return None
+        return _nzb_archive_pluck(files, tmp, target, log)
 
     bad = make_bad_filter(target.artist)
     ranked = []
@@ -661,6 +733,117 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
     return out, name
 
 
+def _nzb_archive_pluck(files, tmp: Path, target: Target,
+                       log) -> tuple[Path, str] | None:
+    """The release has no bare media file: the audio is inside an archive
+    (RAR/zip/7z) with recovery/parity files. Fetch the whole set over NNTP,
+    verify (and repair) with par2 when present, extract with unar, then
+    pluck the track with the same title-hit/format/size ranking as the
+    bare-file path."""
+    total = sum(b for _s, _g, segs in files for _, b in segs)
+    if total > NZB_MAX_ARCHIVE:
+        log(f"        archive release too large: {total / 1e6:.0f} MB > "
+            f"{NZB_MAX_ARCHIVE / 1e6:.0f} MB cap")
+        return None
+    log(f"        archive release: fetching whole set "
+        f"({len(files)} files, ~{total / 1e6:.0f} MB)")
+    arc = tmp / "arc"
+    arc.mkdir(exist_ok=True)
+    try:
+        import nntplib  # stdlib; absent from Python 3.14+ hosts
+        conn = nntplib.NNTP_SSL(NNTP_HOST, NNTP_PORT, user=NNTP_USER,
+                                password=NNTP_PASS, timeout=30)
+    except Exception as e:
+        log(f"        NNTP connect failed: {e}")
+        return None
+    cur_grp = None
+    try:
+        for subj, grp, segs in files:
+            if grp and grp != cur_grp:
+                try:
+                    conn.group(grp)
+                except Exception as e:
+                    log(f"        group select failed ({grp}): {e}")
+                    return None
+                cur_grp = grp
+            blob = b""
+            for n, (mid, _enc) in enumerate(segs, 1):
+                try:
+                    _resp, info = conn.body(f"<{mid}>")
+                except Exception as e:
+                    log(f"        part {n}/{len(segs)} failed: {e}")
+                    return None
+                part = _yenc_part(info.lines)
+                if part is None:
+                    log(f"        part {n}/{len(segs)}: yEnc/CRC error")
+                    return None
+                blob += part
+            (arc / _nzb_file_name(subj)).write_bytes(blob)
+    finally:
+        try:
+            conn.quit()
+        except Exception:
+            pass
+    par2 = next(arc.glob("*.par2"), None)
+    if par2 is not None and shutil.which("par2"):
+        proc = subprocess.run(["par2", "v", str(par2)], cwd=arc,
+                              capture_output=True, timeout=900)
+        out = (proc.stdout or b"").decode(errors="replace")
+        if "repair is not required" in out:
+            log("        par2: all files correct")
+        else:
+            log("        par2: problems found - repairing")
+            subprocess.run(["par2", "r", str(par2)], cwd=arc,
+                           capture_output=True, timeout=3600)
+    archives = sorted(
+        (p for p in arc.iterdir()
+         if p.is_file()
+         and p.name.rsplit(".", 1)[-1].lower() in NZB_ARCHIVE_EXTS),
+        key=lambda p: p.name.lower())
+    if not archives:
+        log("        no archive file in release")
+        return None
+    primary = (next((p for p in archives
+                     if p.name.lower().endswith(".part1.rar")), None)
+               or next((p for p in archives if p.suffix.lower() == ".rar"),
+                       archives[0]))
+    if not shutil.which("unar"):
+        log("        unar not installed; cannot extract archive")
+        return None
+    outdir = tmp / "arc_x"
+    outdir.mkdir(exist_ok=True)
+    proc = subprocess.run(["unar", "-f", "-o", str(outdir), str(primary)],
+                          capture_output=True, timeout=3600)
+    if proc.returncode != 0:
+        err = proc.stderr.decode(errors="replace").strip().splitlines()
+        log(f"        extraction failed: {err[-1] if err else 'unknown'}")
+        return None
+    audio = [p for p in outdir.rglob("*")
+             if p.is_file() and p.suffix.lower().lstrip(".") in NZB_AUDIO_EXTS]
+    if not audio:
+        log("        no audio file in archive")
+        return None
+    bad = make_bad_filter(target.artist)
+    ranked = []
+    for p in audio:
+        if bad(p.name):
+            continue
+        ext = p.suffix.lower().lstrip(".")
+        fmt = {"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
+               "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0)
+        hit = (1 if _norm(target.title) and _norm(target.title)
+               in _norm(p.name) else 0)
+        ranked.append((hit, fmt, p.stat().st_size, p))
+    if not ranked:
+        log("        no usable audio file in archive (censored/altered only)")
+        return None
+    top_hit = max(r[0] for r in ranked)
+    final = [r for r in ranked if r[0] == top_hit]
+    _, _, _, best = max(final, key=lambda r: (r[1], r[2]))
+    log(f"        archive pluck: {best.name}")
+    return best, best.name
+
+
 def _year_mismatch(title: str, year: str) -> bool:
     """True when the release title carries a concrete year more than 5
     years from the target year (a different era - e.g. a 2014 remix pack
@@ -703,10 +886,55 @@ def _consensus_duration(artist: str, title: str) -> float | None:
     return best[len(best) // 2]
 
 
+def _acoustid_identify(path: Path) -> tuple[str, str, float] | None:
+    """Fingerprint `path` (chromaprint) and look it up on AcoustID.
+    Returns (artist, title, confidence) for the best match, or None when
+    no key is set, fpcalc is missing, or the service fails."""
+    if not ACOUSTID_KEY or not shutil.which("fpcalc"):
+        return None
+    try:
+        proc = subprocess.run(["fpcalc", "--json", str(path)],
+                              capture_output=True, timeout=300)
+        if proc.returncode != 0:
+            return None
+        j = json.loads(proc.stdout)
+        fp, dur = j["fingerprint"], int(j["duration"])
+    except (OSError, ValueError, KeyError):
+        return None
+    url = (f"https://{ACOUSTID_HOST}/api/1/?clientkey={ACOUSTID_KEY}"
+           f"&fingerprint={fp}&duration={dur}&meta=tracks&format=json")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    results = d.get("results") or []
+    if not results:
+        return None
+    top = results[0]
+    conf = float(top.get("score") or 0.0)
+    tracks = top.get("tracks") or []
+    if not tracks:
+        return None
+    return (str(tracks[0].get("artist") or ""),
+            str(tracks[0].get("recording") or ""), conf)
+
+
+def _acoustid_matches(artist: str, title: str, target: Target) -> bool:
+    if not artist or not title:
+        return False
+    artist_ok = (_norm(target.artist) in _norm(artist)
+                 or _norm(artist) in _norm(target.artist))
+    return artist_ok and (title_present(title, target.title)
+                          or title_present(target.title, title))
+
+
 def verify_download(path: Path, cand: Candidate, target: Target,
                     llm: LLM, use_llm: bool, log,
                     file_name: str = "") -> tuple[bool, str, str]:
-    """(ok, gate, reason). gate: 'probe' | 'duration' | 'llm' | 'filter-only'."""
+    """(ok, gate, reason). gate: 'probe' | 'duration' | 'acoustid' | 'llm'
+    | 'filter-only'."""
     info = probe(path)
     if not info:
         return False, "probe", "no decodable audio stream"
@@ -730,6 +958,20 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         if expect and abs(info["duration"] - expect) > 15.0:
             return False, "duration", (
                 f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
+    ident = _acoustid_identify(path)
+    if ident is not None:
+        id_artist, id_title, conf = ident
+        if conf >= ACOUSTID_MIN_CONF:
+            if not _acoustid_matches(id_artist, id_title, target):
+                return False, "acoustid", (
+                    f"fingerprint identifies as {id_artist} - {id_title} "
+                    f"(conf {conf:.0f})")
+            log(f"        acoustid: {id_artist} - {id_title} "
+                f"(conf {conf:.0f}) - matches target")
+        else:
+            log(f"        acoustid: best conf {conf:.0f} < "
+                f"{ACOUSTID_MIN_CONF:.0f} - gate skipped")
+
     if not (use_llm and llm):
         return True, "filter-only", ""
     extra = f'\nsource_file="{file_name}"' if file_name else ""
@@ -816,7 +1058,8 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
     log(f"[1/5] discover: {raw!r}")
     target = discover(raw, llm, opts.use_llm, log)
     log(f"      -> {target.artist} - {target.title}"
-        + (f" ({target.year})" if target.year else " (year unknown)"))
+        + (f" ({target.year})" if target.year else " (year unknown)")
+        + (f" [{target.album}]" if target.album else ""))
 
     outdir = opts.outdir
     try:
