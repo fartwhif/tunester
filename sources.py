@@ -311,7 +311,7 @@ def _nzb_search(artist: str, title: str, year: str = "") -> list[Candidate]:
     year, so it keeps the original ahead of reissue/remaster packs.
     nzb.life ANDs free-text terms, so when no release title carries the
     year the yeared query returns nothing - fall back to the bare query
-    (searches are free; only getnzb spends)."""
+    (searches cost nothing; only getnzb fetches a manifest)."""
     cands = _nzb_query(f"{artist} {title}" + (f" {year}" if year else ""))
     if not cands and year:
         cands = _nzb_query(f"{artist} {title}")

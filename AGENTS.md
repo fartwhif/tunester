@@ -5,10 +5,11 @@ Docker pipeline: dirty song name → verified uncensored 160 kbps CBR MP3 in
 orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
 
 ## Sources (priority order)
-1. **nzb.life / Usenet** (top priority). Free tier: `getnzb` 429
-   "Already Downloaded" = 24 h per-release cooldown; NZB cache
-   `/data/.nzb-cache/<hash>.nzb` makes re-fetch free. Every getnzb on an
-   uncached release spends one free-tier download — keep spends minimal.
+1. **nzb.life / Usenet** (top priority). Account is **VIP membership**
+   (363 days left as of 2026-09-29): no free-tier getnzb quota to conserve. `getnzb`
+   429 "Already Downloaded" (24 h per-release cooldown) is raised, not
+   retried (`sources._nzb_get`); NZB cache `/data/.nzb-cache/<hash>.nzb`
+   still avoids repeat getnzb per release.
    NNTP: `news.usenetserver.com:563` (creds in `.env`), yEnc with per-part
    CRC-32 gate in `pipeline._yenc_part`.
 2. SoundCloud (yt-dlp; full tracks DRM-protected → search works, download

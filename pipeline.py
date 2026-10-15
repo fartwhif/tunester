@@ -529,8 +529,8 @@ def _yenc_part(body: list[bytes]) -> bytes | None:
 
 
 def _nzb_cache_path(release_hash: str) -> Path | None:
-    """Persistent .nzb cache path. A release's NZB is static, so the free
-    tier's per-download getnzb quota is spent once per release, not per run."""
+    """Persistent .nzb cache path. A release's NZB is static, so getnzb
+    runs once per release, not per run."""
     d = Path(os.environ.get("TUNESTER_NZB_CACHE", "/data/.nzb-cache"))
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -541,7 +541,7 @@ def _nzb_cache_path(release_hash: str) -> Path | None:
 
 def _nzb_manifest(cand: Candidate, log) -> bytes | None:
     """Fetch a release's NZB manifest; served from the persistent cache
-    when available, so the free-tier getnzb is spent once per release."""
+    when available, so getnzb runs once per release."""
     cp = _nzb_cache_path(cand.url)
     if cp is not None:
         try:
