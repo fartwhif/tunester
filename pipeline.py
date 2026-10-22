@@ -67,6 +67,7 @@ class Target:
     artist: str
     title: str
     year: str = ""
+    cd_year: str = ""  # first standard CD release year = the tag year
     album: str = ""
     mb_duration: float = 0.0  # seconds; 0.0 = no reliable anchor
 
@@ -98,11 +99,17 @@ DISCOVER_SYSTEM = """You identify a single specific song from a user's rough, po
 Reply with ONLY a JSON object, no other text:
 {"artist":"canonical artist name","title":"canonical song title",
  "year":"original studio release year as 4 digits, or empty string if unknown",
+ "cd_year":"year the song first appeared on a standard commercial CD, as 4 digits, or empty string if unknown",
  "album":"name of the album the song first appeared on, or empty string if unknown"}
 
 Rules:
 - Use the canonical names as released; keep original casing.
 - year is the original studio release year, not a remaster or cover year.
+- cd_year is the FIRST standard commercial CD release of the song: for
+  songs originally released on CD (mid-1980s onward) that is the
+  original release year; for pre-CD songs it is the year the original
+  album or single was first issued on CD - not a remaster, reissue,
+  greatest-hits, remix or promo release. "" if genuinely unknown.
 - album is the original album the song first appeared on (not a compilation,
   greatest-hits, or remix album); "" if it was a standalone single or unknown.
 - If the input is already in "Artist - Title" form, parse it verbatim.
@@ -135,11 +142,13 @@ def find_cookies(explicit: Path | None) -> Path | None:
 
 def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     raw = raw.strip()
+    cd_year = ""
     if use_llm:
         d = llm.chat_json(DISCOVER_SYSTEM, raw)
         artist = str(d.get("artist") or "").strip()
         title = str(d.get("title") or "").strip()
         year = _clean_year(str(d.get("year") or ""))
+        cd_year = _clean_year(str(d.get("cd_year") or ""))
         album = str(d.get("album") or "").strip()
         if not artist or not title:
             raise TuneError(f"LLM could not identify the song "
@@ -156,12 +165,28 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
             raise TuneError("cannot parse 'Artist - Title' without the LLM; "
                             "rerun without --no-llm")
         artist, title, album = m.group(1).strip(), m.group(2).strip(), ""
-    if not album:
-        album = musicbrainz_album(artist, title, year, log)
+    if not album or _mb_release_exists(artist, album, log) is False:
+        # An LLM album MusicBrainz refutes is often a label name or a
+        # wrong guess (qwen said "Ruckus" for Men Without Hats); the
+        # album query - how original-album CD rips are found - is only
+        # as good as this string, so re-derive it from the MB tally.
+        album = musicbrainz_album(artist, title, year, log) or album
+    # The tag year is the first standard CD release year: CD-era rips
+    # of a pre-CD album carry the CD pressing's date, not the studio
+    # year (Men Without Hats "Rhythm of Youth": 1982 vinyl, 1984
+    # Statik CD). A CD cannot predate the studio recording, so an
+    # earlier answer is a slip and is dropped.
+    if year and cd_year and int(cd_year) < int(year):
+        cd_year = ""
+    if not cd_year:
+        cd_year = musicbrainz_cd_year(artist, title, log)
     target = Target(artist, title, year, album)
+    target.cd_year = cd_year
     target.mb_duration = musicbrainz_duration(artist, title, year, log)
     if target.mb_duration:
         log(f"      duration anchor (MusicBrainz): {target.mb_duration:.0f}s")
+    if cd_year and cd_year != year:
+        log(f"      tag year (first standard CD): {cd_year}")
     return target
 
 
@@ -260,6 +285,26 @@ def musicbrainz_duration(artist: str, title: str, year: str,
     return _cluster_median([L for _, L in dated])
 
 
+def _mb_release_exists(artist: str, album: str, log) -> bool | None:
+    """True/False when MusicBrainz confirms/refutes a release titled
+    `album` by `artist`; None on API failure (a failure is not a
+    refutation - keep the LLM's album then)."""
+    q = urllib.parse.urlencode({
+        "query": f'release:"{album}" AND artist:"{artist}"',
+        "fmt": "json", "limit": 10})
+    data = _mb_get(f"/release?{q}", log)
+    if data is None:
+        return None
+    a, t = _norm(artist), _norm(album)
+    for r in data.get("releases", []):
+        rt = _norm(str(r.get("title") or ""))
+        ac = _norm(" ".join(x.get("name", "")
+                            for x in r.get("artist-credit", [])))
+        if rt == t and (a in ac or ac in a):
+            return True
+    return False
+
+
 def musicbrainz_album(artist: str, title: str, year: str = "",
                       log=print) -> str:
     """Original album name from MusicBrainz, "" when unknown.
@@ -312,6 +357,47 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
     keys = window.keys() if (year and window) else counts.keys()
     best = min(keys, key=lambda n: (-counts[n], earliest.get(n, "9999")))
     return display[best]
+
+
+def musicbrainz_cd_year(artist: str, title: str, log=print) -> str:
+    """Earliest standard CD release year from MusicBrainz, "" when
+    unknown. Fallback when the LLM gives no cd_year: the recording
+    search (inc=releases) lists every release carrying an exact-title
+    match; a release counts when a medium has format CD and a dated
+    official (else non-bootleg) status, and the earliest official year
+    wins. MB's early-CD coverage is patchy (an early pressing can be a
+    label-less stub, or missing entirely), so the LLM's answer is
+    preferred when it has one."""
+    q = urllib.parse.urlencode({
+        "query": f'recording:"{title}" AND artist:"{artist}"',
+        "fmt": "json", "limit": 100, "inc": "releases"})
+    data = _mb_get(f"/recording?{q}", log)
+    if not data:
+        return ""
+    a, t = _norm(artist), _norm(title)
+    official, other = "", ""
+    for r in data.get("recordings", []):
+        if _norm(str(r.get("title") or "")) != t:
+            continue
+        ac = _norm(" ".join(x.get("name", "")
+                            for x in r.get("artist-credit", [])))
+        if not (a in ac or ac in a):
+            continue
+        for rel in r.get("releases", []):
+            d = str(rel.get("date") or "")
+            if not re.match(r"\d{4}", d):
+                continue
+            if not any(m.get("format") == "CD" for m in rel.get("media", [])):
+                continue
+            status = str(rel.get("status") or "").lower()
+            if status == "bootleg":
+                continue
+            y = d[:4]
+            if status == "official":
+                official = y if not official or y < official else official
+            else:
+                other = y if not other or y < other else other
+    return official or other
 
 
 def probe(path: Path) -> dict | None:
@@ -610,6 +696,7 @@ def _nzb_album_cands(target: Target, seen: set[str],
     def _rank(c):
         t = c.title.lower()
         return (target.album.lower() in t,
+                "flac" in t or "wav" in t or "cd" in t,
                 bool(target.year) and target.year in c.title,
                 -c.posted)
     cands = sorted(cands, key=_rank, reverse=True)
@@ -887,10 +974,16 @@ def _consensus_duration(artist: str, title: str) -> float | None:
     return best[len(best) // 2]
 
 
-def _acoustid_identify(path: Path) -> tuple[str, str, float] | None:
+def _acoustid_identify(path: Path, target: Target) -> tuple[str, str, float] | None:
     """Fingerprint `path` (chromaprint) and look it up on AcoustID (v2).
     Returns (artist, title, confidence 0..1) for the best match, or None
-    when no key is set, fpcalc is missing, or the service fails."""
+    when no key is set, fpcalc is missing, or the service fails.
+
+    The best result is a cluster of acoustically similar recordings. If
+    ANY member matches the target, the target match is returned: a
+    misattributed copy can rank first in the cluster (the genuine
+    Men Without Hats "The Safety Dance" was outranked by a "SIRCH -
+    Safety Dance" entry for the same audio, 2026-10-21)."""
     if not ACOUSTID_KEY or not shutil.which("fpcalc"):
         return None
     try:
@@ -930,6 +1023,12 @@ def _acoustid_identify(path: Path) -> tuple[str, str, float] | None:
     recs = top.get("recordings") or []
     if not recs:
         return None
+    for rec in recs:
+        artists = rec.get("artists") or []
+        artist = str(artists[0].get("name") or "") if artists else ""
+        title = str(rec.get("title") or "")
+        if title and _acoustid_matches(artist, title, target):
+            return artist, title, conf
     rec = recs[0]
     artists = rec.get("artists") or []
     artist = str(artists[0].get("name") or "") if artists else ""
@@ -976,7 +1075,7 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         if expect and abs(info["duration"] - expect) > 15.0:
             return False, "duration", (
                 f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
-    ident = _acoustid_identify(path)
+    ident = _acoustid_identify(path, target)
     if ident is not None:
         id_artist, id_title, conf = ident
         if conf >= ACOUSTID_MIN_CONF:
@@ -1022,8 +1121,9 @@ def transcode(src: Path, dst: Path, target: Target) -> None:
            "-write_xing", "1",
            "-metadata", f"title={target.title}",
            "-metadata", f"artist={target.artist}"]
-    if target.year:
-        cmd += ["-metadata", f"date={target.year}"]
+    tag_year = target.cd_year or target.year
+    if tag_year:
+        cmd += ["-metadata", f"date={tag_year}"]
     cmd += [str(dst)]
     proc = subprocess.run(cmd, capture_output=True, timeout=DOWNLOAD_TIMEOUT)
     if proc.returncode != 0 or not dst.exists():
@@ -1061,8 +1161,9 @@ def sanitize_name(s: str) -> str:
 
 def target_filename(target: Target) -> str:
     name = f"{target.artist} - {target.title}"
-    if target.year:
-        name += f" ({target.year})"
+    tag_year = target.cd_year or target.year
+    if tag_year:
+        name += f" ({tag_year})"
     return sanitize_name(name) + ".mp3"
 
 
@@ -1075,8 +1176,9 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
 
     log(f"[1/5] discover: {raw!r}")
     target = discover(raw, llm, opts.use_llm, log)
+    tag_year = target.cd_year or target.year
     log(f"      -> {target.artist} - {target.title}"
-        + (f" ({target.year})" if target.year else " (year unknown)")
+        + (f" ({tag_year})" if tag_year else " (year unknown)")
         + (f" [{target.album}]" if target.album else ""))
 
     outdir = opts.outdir
@@ -1148,7 +1250,8 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
                     continue
                 out_info = probe(dst) or {}
                 log(f"[5/5] done -> {dst}")
-                return Result(target.artist, target.title, target.year,
+                return Result(target.artist, target.title,
+                              target.cd_year or target.year,
                               cand.source, cand.url, dst, gate,
                               out_info.get("duration", 0.0))
         raise TuneError("all sources exhausted - no verified uncensored copy found",

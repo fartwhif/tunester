@@ -12,12 +12,18 @@ orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
    still avoids repeat getnzb per release.
    NNTP: `news.usenetserver.com:563` (creds in `.env`), yEnc with per-part
    CRC-32 gate in `pipeline._yenc_part`.
-2. SoundCloud (yt-dlp; full tracks DRM-protected → search works, download
-   mostly errors out).
-3. archive.org (file `length` is parsed into `Candidate.duration`).
+2. archive.org (file `length` is parsed into `Candidate.duration`;
+   `mediatype:(movies)` items and video containers are also searched -
+   an official music video's audio track IS the studio recording and is
+   transcoded `-vn` via the same video-release path as nzb).
+3. SoundCloud (yt-dlp; full tracks DRM-protected → search works,
+   download mostly errors out; the uploadable remainder is mostly
+   covers/remixes/clean-titled karaoke - moved after archive 2026-10-21).
 ## API / interop
 - `POST /api/tune` job objects carry `artist`/`title`/`year` (the
-  discovered fixup data) on BOTH `done` and `error` statuses. `TuneError`
+  discovered fixup data) on BOTH `done` and `error` statuses. The
+  `year` field is the TAG year (first standard CD release year,
+  studio year when that is unknown - see "Tag year" below). `TuneError`
   has a `.target` (Target|None): discovery succeeds even when no verified
   file is delivered, so a failed job still exposes artist/title/year.
 - tunester is attached to the external `shared` docker network so other
@@ -29,6 +35,29 @@ orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
   (catalog + per-item JSON, hence `grabby-index.json` for DrivePod); the
   library UI shows it as a read-only badge. Fixup-only runs do NOT set it.
 
+## Tag year (first standard CD)
+Delivered files are tagged with the **first standard CD release year**,
+not the studio recording year: `Target.year` = original studio year
+(still used for ALL search/curation: nzb query, `_year_mismatch`, MB
+duration/album windows); `Target.cd_year` = tag year; the filename
+`(YYYY)`, ID3 `date=`, and `Result.year` (hence the API job field) all
+use `cd_year or year`.
+Chain in `discover`: LLM `cd_year` (DISCOVER_SYSTEM field; accepted only
+when 4-digit and >= the studio year - a CD cannot predate the recording)
+-> `musicbrainz_cd_year` (one recording search with `inc=releases`;
+earliest dated CD-medium release, official status preferred, bootlegs
+skipped) -> studio year.
+- 2026-10-21 (MWH "The Safety Dance"): qwen38-27b answers `""` for
+  cd_year in the 4-field JSON and hallucinates **1985** when asked a
+  targeted follow-up question - so NO targeted follow-up call was added.
+  MB's only pre-2010 CD record is a **1983** CA pressing with no label
+  info, so the delivery is tagged 1983. Wikipedia says 1984 (Statik
+  European CD with bonus tracks); Discogs is bot-blocked from this
+  host, so the pre-CD tag year for this song is machine-ambiguous.
+- MB early-CD coverage is patchy (label-less stubs, missing pressings);
+  mid-80s-onward songs normally get cd_year == studio year, and pre-CD
+  songs are where the uncertainty lives.
+
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
 **AcoustID content gate** (optional) → LLM version gate (clean/radio →
@@ -39,14 +68,26 @@ reject).
   download (chromaprint) and looks it up on AcoustID via the **v2 API**
   (`POST https://api.acoustid.org/v2/lookup`, param `client`, `meta=recordings`;
   the legacy `acoustid.org/api/1/` endpoint is gone - 404). Confidence is the
-  result `score` on a **0..1** scale; the best result's top recording
-  (`results[0].recordings[0]` = artist+title) that is NOT the target rejects
+  the result `score` on a **0..1** scale. The best result is a cluster of
+  similar recordings: if ANY member matches the target it is a strong
+  pass, else the cluster's top recording that is NOT the target rejects
   with gate `acoustid` when score ≥ `TUNESTER_ACOUSTID_MIN_CONF` (default
   **0.7**), a match is a strong pass. This is the ONLY gate that catches a
   mislabeled article — a file named/tagged "Loser" that contains a different
   song of the right length passes every name/duration/LLM gate (see the Beck
   "Loser" 2026-09-28 pitfall below). Silently skipped when the key or fpcalc
   is absent. Key = the user's API key from acoustid.org (set in `.env`).
+- **Karaoke/instrumental blind spot** (2026-10-21): AcoustID returns
+  `None` for instrumentals (they are not in the recording DB), so a
+  clean-titled karaoke upload of the RIGHT song at the RIGHT length
+  passes every gate - no text-only gate can see that vocals are
+  missing (Men Without Hats "The Safety Dance": the nzb release was an
+  expired "Extended Club Mix" and SoundCloud's only clean-titled
+  candidate was a troll's karaoke; MB anchor is 164 s = the genuine
+  2:45 studio cut, which the 2:42 karaoke matched). Mitigation = source
+  priority: archive.org (official videos carry the studio audio) now
+  outranks SoundCloud, and `_archive_search` merges a
+  `mediatype:(movies)` query + video container extensions.
 - The LLM is NOT trusted with duration: pretests showed it fabricates a
   matching studio length and rationalizes the input (said "matches ~2:56"
   for a 175 s file and "~3:38" for a 231 s file of the same song).
@@ -78,13 +119,25 @@ Release names are untrustworthy — selection is by **per-file** names:
   carries a year more than ±5 away are dropped at pick (2014 HAA remix
   pack vs a 2001 target; 2005 single pressings of the same studio cut
   pass); year-less titles always pass.
+- `NEVER_PHRASES` also drops dance/remix labels: "club mix", "dance
+  mix", "extended mix", "ultra mix", "long version", "biomix"
+  (2026-10-21: "The Safety Dance Extended Club Mix" is the 4:32
+  extended version, not the studio cut).
 - `TRIALS_PER_SOURCE` default 5 (env `TUNESTER_TRIALS`).
+- **CD/album track over music video** (2026-10-21): `pick` sorts
+  `(-media_tier, score, popularity, -posted)` where `_media_tier` reads
+  the candidate URL extension - 0 = lossless (FLAC/WAV, a CD rip),
+  1 = lossy or no extension, 2 = video (MKV/MP4/...). So the standard
+  CD/album audio-native track is tried before a music-video's audio
+  track, and lossless before lossy. Only archive.org candidates carry a
+  real file extension (nzb IDs and soundcloud track URLs are neutral),
+  and nzb already prefers an audio file within a release at download.
 - **Age preference**: nzb candidates carry the release post timestamp
-  (`Candidate.posted`, from the feed `<pubDate>`); `pick` sorts
-  `(score, popularity, -posted)` so, all else equal, OLD established releases
-  outrank fresh uploads - new uploads' names/tags have proven unreliable
-  (2015/2025/2026 "Mellow Gold" re-uploads vs the 2011-2013 rips). The
-  album-pluck `_rank` uses the same oldest-first tiebreak.
+  (`Candidate.posted`, from the feed `<pubDate>`); after the media tier
+  and relevance `pick` breaks ties oldest-first, so OLD established
+  releases outrank fresh uploads - new uploads' names/tags have proven
+  unreliable (2015/2025/2026 "Mellow Gold" re-uploads vs the 2011-2013
+  rips). The album-pluck `_rank` uses the same oldest-first tiebreak.
 - `search_candidates(..., year=, album=)`: nzb query appends the year
   (free-text relevance hint; pushes original pressings to the top of
   nzb.life results). nzb.life ANDs free text, so if no release title
@@ -146,6 +199,11 @@ Early-return on the first verified release caps quota spend.
   excluding titles equal to the song (the single = the 12" false front),
   preferring a +/-1-year window when the year is known. Beck -> Mellow
   Gold; Sledgehammer/Big Time -> So; One Step Closer -> Hybrid Theory.
+  2026-10-21: a NON-empty LLM album is also checked - `_mb_release_exists`
+  asks MB whether the artist has a release by that name, and a REFUTED
+  album (qwen returned "Ruckus", the label, for Men Without Hats) is
+  re-derived from the tally above, since the album query is how original-
+  album CD rips are found. An API failure (None) keeps the LLM's album.
 
 - All LLM prompts (system + user) are appended to the status ticker via
   `LLM(log=...)` inside `chat()` — single choke point; both the discover
@@ -191,6 +249,13 @@ endpoint (refused/DNS/reset, `_DEAD_REASONS`) fails over immediately;
 the last fallback keeps `LOAD_WAIT`=360 s cold-start wait.
 `CHAT_TIMEOUT`=240 s. All keys share one bearer (qwen reuses
 `OPENAI_API_KEY`). Gate degrades to filter-only if ALL backends fail.
+- 2026-10-21: BOTH backends flaked mid-run (qwen38-27b exceeded the 90 s
+  failover budget on a 12 s prompt; llm1 returned HTTP 504) and
+  `discover` raised "all LLMs failed". A `--no-llm` run degrades to
+  heuristic parse + filter-only verify - the probe/duration/AcoustID
+  gates still run, but the LLM version gate (the only defense vs a
+  clean-titled cover/karaoke) is OFF, so prefer waiting for the
+  backends to recover over delivering `--no-llm` output.
 
 ## Verified deliveries (2026-09-27)
 - Peter Gabriel – Sledgehammer (1986): 282.5 s, 160 k CBR — good.
@@ -213,3 +278,16 @@ the last fallback keeps `LOAD_WAIT`=360 s cold-start wait.
   2013 WRS / 2015 re-uploads. Replaces two earlier WRONG deliveries (269.7 s
   "Fume" mis-tagged B-side; then the 236.7 s VLS a1 — a different song that
   passed every name/duration/LLM gate). See the 2026-09-28 curation pitfall.
+- Men Without Hats – The Safety Dance (1981): 165 s, 160 k CBR
+  (2026-10-21) - track 06 of the "Rhythm of Youth (1982)" FLAC (CD) rip
+  on archive.org (lossless CD/album track, preferred over the official
+  HD music video by the media-tier ranking). AcoustID matched the
+  genuine MWH entry at 91-100%. The nzb release was only an expired
+  "Extended Club Mix". Two gates were fixed to make this deliverable:
+  (1) AcoustID's top cluster ranked a misattributed "SIRCH - Safety
+  Dance" entry first, so `_acoustid_identify` now scans the WHOLE best
+  cluster for a target match (was `recordings[0]`-only); (2) the LLM
+  returned album="Ruckus" (the label), refuted by MB, so `discover`
+  re-derived "Rhythm of Youth" from the tally - that album query is what
+  surfaced the FLAC (CD) item. See the karaoke blind-spot + source-
+  priority notes (2026-10-21).

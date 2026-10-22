@@ -69,6 +69,8 @@ NEVER_PHRASES = (
     "clean version", "clean edit", "radio edit", "radio version",
     "slowed reverb", "speed up", "sped up", "lyric video", "lyrics video",
     "off key", "piano cover", "a capella", "explicit removed",
+    "club mix", "dance mix", "extended mix", "ultra mix", "long version",
+    "biomix",
 )
 NEVER_PARENS = re.compile(r"(?i)\((clean|radio\s*edit|censored)\)")
 
@@ -81,6 +83,10 @@ class Source:
 
 
 # Best to worst: coverage x integrity x reliability.
+# archive.org before SoundCloud: SoundCloud full tracks are DRM-protected
+# (search works, downloads mostly error out) and the uploadable ones have
+# proven to be covers/remixes/clean-titled karaoke - the Wil Bakx "Safety
+# Dance" karaoke (2026-10-21) passed every text-only QC gate.
 # Backburner (2026-09-26): YouTube is a poor source for uncensored studio
 # originals, and this VPS IP gets bot-checked (the player response also
 # needs the yt-dlp EJS JS-runtime signature solver; see yt-dlp/yt-dlp/wiki/EJS).
@@ -89,8 +95,8 @@ class Source:
 #     Source("youtube-loose", "YouTube (deep)", "ytsearch_loose"),
 SOURCES = [
     Source("nzb", "nzb.life (Usenet)", "nzb"),
-    Source("soundcloud", "SoundCloud", "scsearch"),
     Source("archive", "archive.org", "archive"),
+    Source("soundcloud", "SoundCloud", "scsearch"),
 ]
 
 
@@ -143,6 +149,26 @@ def title_present(cand_title: str, target_title: str) -> bool:
     if b and b in a:
         return True
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+
+
+# Candidate container preference: the standard CD/album track
+# (an audio-native file) is tried before a music-video's audio track,
+# which remains the fallback. Lossless (CD rip) ranks above lossy.
+_LOSSLESS_EXTS = {"flac", "wav", "aif", "aiff", "ape", "tta", "wv"}
+_VIDEO_EXTS = {"mkv", "mp4", "m4v", "mov", "avi", "wmv", "flv", "webm", "ogv"}
+
+
+def _media_tier(url: str) -> int:
+    """Preference tier for a candidate's container, read from its URL
+    extension: 0 = lossless audio (CD rip), 1 = lossy audio or no
+    extension (nzb IDs, soundcloud track URLs), 2 = video container.
+    Only direct-file sources (archive.org) expose a real extension."""
+    ext = Path(urllib.parse.urlparse(url).path).suffix.lower().lstrip(".")
+    if ext in _LOSSLESS_EXTS:
+        return 0
+    if ext in _VIDEO_EXTS:
+        return 2
+    return 1
 
 
 def _score(cand: Candidate, artist: str) -> None:
@@ -224,16 +250,20 @@ def _parse_length(value) -> float | None:
 
 
 def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]:
-    """Title query first; full-album uploads rarely mention individual
-    track names in item metadata, so fall back to the album name and
-    let the per-file title filter pluck the track."""
+    """Audio items first; full-album uploads rarely mention individual
+    track names in item metadata, so the album query lets the per-file
+    title filter pluck the track. Video items (official music videos)
+    are the fallback when no audio upload exists - the transcode step
+    extracts the audio track, which for a video release is the studio
+    recording. All queries merge; the per-file filters rank the rest."""
     queries = [f"{artist} {title} AND mediatype:(audio)"]
     if album:
         queries.append(f"{artist} {album} AND mediatype:(audio)")
+    queries.append(f"{artist} {title} AND mediatype:(movies)")
     cands: list[Candidate] = []
     bad = make_bad_filter(artist)
     want = _norm(title)
-    for qi, q in enumerate(queries):
+    for q in queries:
         url = ("https://archive.org/advancedsearch.php?"
                f"q={urllib.parse.quote(q)}&fl%5B%5D=identifier&rows=25&output=json")
         try:
@@ -244,8 +274,6 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
         docs = (data.get("response") or {}).get("docs") or []
         if not docs:
             continue
-        if qi > 0 and cands:
-            break  # only fall back to the album query when nothing found
         for d in docs[:15]:
             ident = d.get("identifier")
             if not ident:
@@ -264,7 +292,8 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
                 if "." not in name:
                     continue
                 ext = name.rsplit(".", 1)[-1].lower()
-                if ext not in ("mp3", "m4a", "ogg", "flac", "opus", "wav"):
+                if ext not in ("mp3", "m4a", "ogg", "flac", "opus", "wav",
+                               "mp4", "m4v", "mov", "avi", "mkv", "webm"):
                     continue
                 base = name.rsplit(".", 1)[0]
                 if want and want not in _norm(base):
@@ -369,9 +398,11 @@ def search_candidates(source: Source, artist: str, title: str,
 def pick(cands: list[Candidate], artist: str, title: str) -> list[Candidate]:
     """Filter out censored/altered/foreign titles; rank best to worst.
 
-    Ties break oldest-first: established usenet releases posted years ago
-    are far more likely to be the genuine article than fresh uploads,
-    whose file names and tags have proven unreliable."""
+    The standard CD/album track (an audio-native file) outranks a
+    music-video's audio track, and lossless outranks lossy. Ties break
+    oldest-first: established usenet releases posted years ago are far
+    more likely to be the genuine article than fresh uploads, whose
+    file names and tags have proven unreliable."""
     bad = make_bad_filter(artist)
     usable = []
     for c in cands:
@@ -382,5 +413,6 @@ def pick(cands: list[Candidate], artist: str, title: str) -> list[Candidate]:
         if c.source == "scsearch" and c.duration is not None and c.duration <= 30:
             continue
         usable.append(c)
-    return sorted(usable, key=lambda c: (c.score, c.popularity, -c.posted),
+    return sorted(usable, key=lambda c: (-_media_tier(c.url), c.score,
+                                         c.popularity, -c.posted),
                   reverse=True)
