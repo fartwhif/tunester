@@ -8,6 +8,7 @@ Stages:
   4. transcode  ffmpeg -> MP3 160 kbps CBR / 44.1 kHz / stereo
   5. name       "ARTIST - TITLE (YEAR).mp3", output re-verified against spec
 """
+import difflib
 import json
 import os
 import re
@@ -113,6 +114,14 @@ Rules:
 - album is the original album the song first appeared on (not a compilation,
   greatest-hits, or remix album); "" if it was a standalone single or unknown.
 - If the input is already in "Artist - Title" form, parse it verbatim.
+- If the input names an artist, that is the artist the user wants:
+  normalize spelling and casing only, never re-attribute the song to a
+  different artist, even if that artist does not appear to have a song
+  by that title (a same-titled song by another artist is a different
+  song).
+- If the input names a title, that is the song the user wants: normalize
+  spelling and casing only, never substitute a different (more famous)
+  song by the same artist with a similar title.
 - Do not substitute a different song. If the year is genuinely unknown, leave it ""."""
 
 VERIFY_SYSTEM = """You are the QC gate of a music download pipeline. The pipeline must only deliver the
@@ -121,6 +130,10 @@ original, unaltered STUDIO recording of a target song, uncensored (the explicit 
 
 Reject (match=false) anything that is: a clean / explicit-removed edit, radio edit, live performance,
 cover, remix, slowed/reverb, sped-up / nightcore, karaoke, instrumental, or lyric video.
+A LIVE performance is never acceptable even when it is the correct song by the correct
+artist and matches in length: the deliverable is the original uncensored studio
+recording as it appears on the standard commercial CD. If the source is a live album,
+a "Live at ..." release, or a concert/festival recording, match=false and version="live".
 A music-video release is judged by its audio track (normally the studio recording);
 scene tags (DDC, 1080p, x264, group names) describe the video, not the audio.
 A multi-track release (12" single, sampler, compilation) is judged by the
@@ -140,6 +153,70 @@ def find_cookies(explicit: Path | None) -> Path | None:
     return None
 
 
+def _requested_artist(raw: str) -> str:
+    """The artist the user explicitly typed in 'Artist - Title' form,
+    or '' for free-form descriptions (where the LLM picks the artist)."""
+    m = re.match(r"^\s*(?:the\s+)?(.+?)\s+[-\u2013\u2014:]\s+(.+?)\s*$", raw.strip())
+    return m.group(1).strip() if m else ""
+
+
+_TITLE_TAGS = re.compile(
+    r"\s*\((?:hd|hq|hi[\s-]?res|official\s+music\s+video|official\s+video|"
+    r"official|mv|video|full\s+song|full|1080p|720p|480p|4k|320\s*kbps|"
+    r"256\s*kbps|192\s*kbps|128\s*kbps|320|256|128|mp3|flac|wav|aac|ogg|"
+    r"m4a|stereo)\)\s*$", re.I)
+
+
+def _requested_title(raw: str) -> str:
+    """The title the user explicitly typed in 'Artist - Title' form,
+    cleaned of a repeated artist prefix ("Gorillaz - Gorillaz - Feel Up"),
+    a trailing year, and technical tags like '(HD)'. '' for free-form
+    descriptions (where the LLM picks the title)."""
+    m = re.match(r"^\s*(?:the\s+)?(.+?)\s+[-\u2013\u2014:]\s+(.+?)\s*$", raw.strip())
+    if not m:
+        return ""
+    artist, title = m.group(1).strip(), m.group(2).strip()
+    # A trailing "(1994)" is the year, not part of the title (the LLM
+    # never includes it in its answer).
+    title = re.sub(r"\s*\((1[9]\d{2}|20\d{2})\)\s*$", "", title)
+    if artist:
+        title = re.sub(rf"^{re.escape(artist)}\s+[-\u2013\u2014:]\s*",
+                       "", title, flags=re.I)
+    for _ in range(2):
+        cleaned = _TITLE_TAGS.sub("", title)
+        if cleaned == title:
+            break
+        title = cleaned
+    return title.strip()
+
+
+def _title_matches(a: str, b: str) -> bool:
+    """Fuzzy title identity: misspellings and casing variants are the same
+    song ('Feel Goud Inc' ~ 'Feel Good Inc.'); a different song never is
+    ('Feel Up' !~ 'Feel Good Inc.'). Deliberately stricter than
+    title_present (a recall-oriented candidate matcher): no containment
+    shortcut, because song titles share words ('Summer' in 'Cruel
+    Summer')."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.8
+
+
+def _artist_matches(a: str, b: str) -> bool:
+    """Fuzzy artist identity: misspellings, casing, and punctuation
+    variants are the same artist ('Rihana' ~ 'Rihanna'); a different
+    artist never is ('Ace of Base' !~ 'Roy Orbison')."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.8
+
+
 def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     raw = raw.strip()
     cd_year = ""
@@ -153,6 +230,28 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
         if not artist or not title:
             raise TuneError(f"LLM could not identify the song "
                             f"(artist={artist!r} title={title!r})")
+        # The prompt licenses the LLM to fix "wrong artist names" and it
+        # can re-attribute a song to a DIFFERENT artist with the same
+        # title ("Ace of Base - Cruel Summer" -> "Roy Orbison - Cruel
+        # Summer (1964)"); every downstream gate then targets the wrong
+        # artist consistently and passes it. An explicitly typed artist
+        # wins: pin it, and drop the LLM's year/cd_year/album (they
+        # describe the substituted song) so the MB lookups below
+        # re-derive them for the requested artist.
+        req_artist = _requested_artist(raw)
+        if req_artist and not _artist_matches(artist, req_artist):
+            log(f"      LLM re-attributed '{artist}'; pinning requested "
+                f"artist '{req_artist}'")
+            artist, year, cd_year, album = req_artist, "", "", ""
+        req_title = _requested_title(raw)
+        if req_title and not _title_matches(title, req_title):
+            # The artist swap one field over: the LLM substitutes a more
+            # famous same-artist song ("Feel Up" -> "Feel Good Inc.");
+            # every downstream gate then targets the wrong song
+            # consistently and passes it. The typed title wins.
+            log(f"      LLM substituted title '{title}'; pinning requested "
+                f"title '{req_title}'")
+            title, year, cd_year, album = req_title, "", "", ""
     else:
         # heuristic fallback: "Artist - Title (YYYY)"
         year = ""
@@ -1083,6 +1182,17 @@ def verify_download(path: Path, cand: Candidate, target: Target,
                 return False, "acoustid", (
                     f"fingerprint identifies as {id_artist} - {id_title} "
                     f"(conf {conf * 100:.0f}%)")
+            # A fingerprint that identifies the content as a LIVE version
+            # of the target still passes _acoustid_matches (the target
+            # title is a substring of the live title) - reject it: the
+            # deliverable is the studio CD recording, and a live take of
+            # the same song is not. A target that is itself a live
+            # recording (rare) is exempt.
+            if re.search(r"\blive\b", id_title, re.I) and not re.search(
+                    r"\blive\b", target.title, re.I):
+                return False, "acoustid", (
+                    f"fingerprint identifies a LIVE version "
+                    f"({id_artist} - {id_title}, conf {conf * 100:.0f}%)")
             log(f"        acoustid: {id_artist} - {id_title} "
                 f"(conf {conf * 100:.0f}%) - matches target")
         else:
@@ -1110,8 +1220,13 @@ def verify_download(path: Path, cand: Candidate, target: Target,
     version = str(d.get("version") or "unknown")
     if not d.get("match"):
         return False, "llm", f"{version}: {d.get('reason', 'rejected')}"
-    if version in ("clean", "radio"):
-        return False, "llm", f"{version}: {d.get('reason', 'censored')}"
+    if version in ("clean", "radio", "live", "cover", "remix"):
+        # The match flag is not trusted on its own: the LLM sometimes
+        # answers match=true while labeling the version live/cover/
+        # remix. Only the studio CD recording is a deliverable, so the
+        # version vocabulary is enforced regardless of the match flag.
+        return False, "llm", (
+            f"{version}: " + (d.get("reason") or "not a studio recording"))
     return True, "llm", ""
 
 

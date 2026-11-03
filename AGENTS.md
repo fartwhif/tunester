@@ -26,6 +26,11 @@ orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
   studio year when that is unknown - see "Tag year" below). `TuneError`
   has a `.target` (Target|None): discovery succeeds even when no verified
   file is delivered, so a failed job still exposes artist/title/year.
+- `GET /api/jobs` lists every job (newest first; `id`/`name`/`status`/
+  `filename`/`error`); `POST /api/clear` cancels all jobs and drops the
+  job state (in-flight workers abort at their next `log()` call -
+  bounded by the current LLM/download step - and downloaded files are
+  left in place). The web UI shows the queue list + a clear button.
 - tunester is attached to the external `shared` docker network so other
   services reach it by container name. GrabbyTube's "Run via tunester"
   library feature (select tracks -> `POST /api/tune` with "author - title",
@@ -58,10 +63,39 @@ skipped) -> studio year.
   mid-80s-onward songs normally get cd_year == studio year, and pre-CD
   songs are where the uncertainty lives.
 
+## Artist & title pin (2026-11-03)
+`discover` pins the artist AND the title the user explicitly typed. The
+LLM is licensed to fix "wrong artist names" / vague descriptions and can:
+(1) re-attribute a song to a DIFFERENT artist with the same title ("Ace
+of Base - Cruel Summer" -> "Roy Orbison - Cruel Summer (1964)"), or
+(2) substitute a more famous SAME-artist song with a similar title
+("Gorillaz - Feel Up" -> "Gorillaz - Feel Good Inc. (2005)"). Every
+downstream gate then targets the wrong song consistently and passes it
+(AcoustID `_acoustid_matches` matches against `target.artist`/`title`,
+which are now the wrong ones).
+`_requested_artist` / `_requested_title` parse an explicit "Artist -
+Title" from the raw input (same regex as the --no-llm heuristic;
+free-form descriptions return "" - there the LLM has the wheel). The
+requested title is cleaned first: a repeated artist prefix ("Gorillaz -
+Gorillaz - Feel Up (HD)" -> title "Feel Up"), a trailing year, and
+technical tags (`_TITLE_TAGS`: HD/320kbps/Official Music Video/...).
+`_artist_matches` fuzzy-compares with normalized equality / containment /
+SequenceMatcher >= 0.8 (misspellings, casing, punctuation, leading
+articles, name changes like "Kanye West" ~ "Ye" are the SAME; "Roy
+Orbison" !~ "Ace of Base"). `_title_matches` is stricter - NO containment
+(song titles share words: "Summer" in "Cruel Summer" must not pass) -
+normalized equality or SequenceMatcher >= 0.8 ("Feel Goud Inc" ~
+"Feel Good Inc.", "Feel Up" !~ "Feel Good Inc."). A mismatch pins the
+requested value and drops the LLM's year/cd_year/album (they describe the
+substituted song); the MB lookups re-derive them. Outcome for an unknown
+track: an honest "all sources exhausted" instead of a different song's
+file. The DISCOVER_SYSTEM prompt also forbids both substitutions (soft);
+the pins are the hard guarantee (LLM output is nondeterministic).
+
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
-**AcoustID content gate** (optional) → LLM version gate (clean/radio →
-reject).
+**AcoustID content gate** (optional) → **LIVE-version gate** → LLM version
+gate (any non-studio version → reject).
 
 - **AcoustID content gate** (`_acoustid_identify`, needs
   `TUNESTER_ACOUSTID_KEY`; fpcalc = `libchromaprint-tools`): fingerprints the
@@ -77,6 +111,22 @@ reject).
   song of the right length passes every name/duration/LLM gate (see the Beck
   "Loser" 2026-09-28 pitfall below). Silently skipped when the key or fpcalc
   is absent. Key = the user's API key from acoustid.org (set in `.env`).
+- **LIVE-version gate (2026-11-03)**: a live take of the correct song by
+  the correct artist at the correct length must NEVER be delivered - the
+  deliverable is the original uncensored studio recording as it appears on
+  the standard commercial CD. Two hard (non-LLM) checks:
+  (1) AcoustID - if the fingerprint identifies the content as a LIVE version
+  (`\blive\b` in the identified title, e.g. "Bohemian Rhapsody (Live at
+  Wembley)") it is rejected with gate `acoustid`, even though it would pass
+  `_acoustid_matches` (target title is a substring of the live title). A
+  target that IS itself a live recording is exempt (rare). Word-boundary
+  match, so "Livin on a Prayer" is not flagged.
+  (2) LLM version vocabulary - the LLM's `match` flag is NOT trusted on its
+  own: `version` in {clean, radio, live, cover, remix} rejects regardless of
+  `match` (the LLM was observed answering match=true while labeling the
+  version live). `VERIFY_SYSTEM` also states a live performance is never
+  acceptable. Name-level live is already dropped by NEVER_WORDS ("live")
+  except when it is part of the artist name (band "Live").
 - **Karaoke/instrumental blind spot** (2026-10-21): AcoustID returns
   `None` for instrumentals (they are not in the recording DB), so a
   clean-titled karaoke upload of the RIGHT song at the RIGHT length

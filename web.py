@@ -12,6 +12,23 @@ _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 
+class _Cancelled(Exception):
+    """Raised from a job's log callback when the queue is cleared."""
+
+
+def _clear_all() -> int:
+    """Cancel every job and drop all job state. In-flight workers abort
+    at their next log() call, which is bounded by the current LLM or
+    download step (TUNESTER_LLM_TIMEOUT / TUNESTER_DOWNLOAD_TIMEOUT).
+    Downloaded files are left in place."""
+    with _LOCK:
+        jobs = list(_JOBS.values())
+        for job in jobs:
+            job["cancelled"] = True
+        _JOBS.clear()
+    return len(jobs)
+
+
 def _new_job(name: str, outdir: Path) -> dict:
     job = {
         "id": uuid.uuid4().hex[:12],
@@ -33,6 +50,8 @@ def _new_job(name: str, outdir: Path) -> dict:
 
 def _run(job: dict, name: str, outdir: Path) -> None:
     def log(msg: str) -> None:
+        if job.get("cancelled"):
+            raise _Cancelled()
         job["log"].append(msg)
         print(msg, flush=True)
 
@@ -44,6 +63,12 @@ def _run(job: dict, name: str, outdir: Path) -> None:
         job["title"] = res.title
         job["year"] = res.year
         job["status"] = "done"
+    except _Cancelled:
+        # The job entry is already gone from _JOBS; this just ends the
+        # worker thread at the next stage boundary instead of letting it
+        # burn through the source fallback chain.
+        job["status"] = "cancelled"
+        print(f"job {job['id']} cancelled (queue cleared)", flush=True)
     except Exception as e:
         job["error"] = str(e)
         # Discovery may have succeeded even when no verified file was
@@ -53,6 +78,12 @@ def _run(job: dict, name: str, outdir: Path) -> None:
             job["artist"] = t.artist
             job["title"] = t.title
             job["year"] = t.year
+        job["status"] = "error"
+    except SystemExit as e:
+        # sys.exit() inside the pipeline is a BaseException: a plain
+        # `except Exception` let such worker threads die silently,
+        # leaving the job stuck at "running" forever.
+        job["error"] = f"worker exited (SystemExit {e.code})"
         job["status"] = "error"
 
 
@@ -77,6 +108,18 @@ UI_HTML = """<!doctype html>
         min-height: 2rem; max-height: 400px; overflow: auto; }
   a.dl { display: inline-block; margin-top: .8rem; color: #4fd6be; font-weight: 600; }
   .err { color: #f28fad; }
+  .q { margin-top: 2.5rem; border-top: 1px solid #2c3442; padding-top: 1rem; }
+  .q .row { display: flex; justify-content: space-between; align-items: center; }
+  .q h2 { font-size: 1.15rem; margin: 0; }
+  .q button { margin-top: 0; padding: .45rem 1.1rem; font-size: 13.5px; }
+  .q ul { list-style: none; padding: 0; margin: .6rem 0 0; }
+  .q li { display: flex; gap: .6rem; align-items: baseline; padding: .3rem 0;
+          color: #8a93a5; font-size: 13.5px; }
+  .q .st { font-weight: 600; flex: none; min-width: 64px; }
+  .st.running { color: #f2c94c; } .st.done { color: #4fd6be; }
+  .st.error, .st.cancelled { color: #f28fad; }
+  .q a { color: #4fd6be; text-decoration: none; }
+  .q .err { font-size: 12.5px; }
 </style></head>
 <body>
 <h1>tune<span>ster</span></h1>
@@ -87,6 +130,11 @@ Sources, best to worst: YouTube, SoundCloud, archive.org, YouTube (deep).</p>
 <button id="go" onclick="tuneIt()">Tune it</button>
 <pre id="log"></pre>
 <a id="dl" class="dl" hidden></a>
+<div class="q">
+  <div class="row"><h2>Queue</h2>
+  <button id="clear" onclick="clearQueue()" disabled>Clear queue (0)</button></div>
+  <ul id="jobs"></ul>
+</div>
 <script>
 let job = null, timer = null;
 async function tuneIt() {
@@ -102,11 +150,19 @@ async function tuneIt() {
   job = d.id;
   timer = setInterval(poll, 1500);
   poll();
+  refreshJobs();
 }
 async function poll() {
   if (!job) return;
   const r = await fetch('/api/job/' + job);
   const j = await r.json();
+  refreshJobs();
+  if (r.status === 404) {
+    // the job was cleared while we were polling
+    clearInterval(timer);
+    document.getElementById('log').textContent += '\\njob cleared';
+    return;
+  }
   document.getElementById('log').textContent =
     (j.log || []).join('\\n') + (j.status === 'running' ? '\\n...' : '');
   if (j.status !== 'running') {
@@ -122,6 +178,48 @@ async function poll() {
     }
   }
 }
+async function refreshJobs() {
+  const r = await fetch('/api/jobs');
+  const d = await r.json();
+  const ul = document.getElementById('jobs');
+  const btn = document.getElementById('clear');
+  ul.innerHTML = '';
+  btn.disabled = !d.jobs.length;
+  btn.textContent = 'Clear queue (' + d.jobs.length + ')';
+  for (const j of d.jobs) {
+    const li = document.createElement('li');
+    const st = document.createElement('span');
+    st.className = 'st ' + j.status;
+    st.textContent = j.status;
+    const nm = document.createElement('span');
+    nm.textContent = j.name;
+    li.append(st, nm);
+    if (j.status === 'done' && j.filename) {
+      const a = document.createElement('a');
+      a.href = '/api/dl/' + j.id;
+      a.textContent = j.filename;
+      li.append(a);
+    } else if (j.error) {
+      const er = document.createElement('span');
+      er.className = 'err';
+      er.textContent = j.error.slice(0, 140);
+      li.append(er);
+    }
+    ul.appendChild(li);
+  }
+}
+async function clearQueue() {
+  const btn = document.getElementById('clear');
+  btn.disabled = true;
+  const r = await fetch('/api/clear', {method: 'POST'});
+  const d = await r.json();
+  document.getElementById('log').textContent +=
+    '\\ncleared ' + d.cleared + ' job(s) from the queue';
+  if (job) { job = null; if (timer) clearInterval(timer); }
+  document.getElementById('go').disabled = false;
+  refreshJobs();
+}
+refreshJobs();
 </script>
 </body></html>
 """
@@ -150,6 +248,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/health":
             self._json(200, {"ok": True})
+            return
+        if self.path == "/api/jobs":
+            with _LOCK:
+                jobs = [
+                    {k: job[k] for k in ("id", "name", "status", "filename", "error")}
+                    for job in _JOBS.values()
+                ]
+            jobs.reverse()
+            self._json(200, {"jobs": jobs})
             return
         m = re.match(r"^/api/job/([\w]+)$", self.path)
         if m:
@@ -180,6 +287,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/api/clear":
+            n = _clear_all()
+            print(f"queue cleared: {n} job(s)", flush=True)
+            self._json(200, {"cleared": n})
+            return
         if self.path != "/api/tune":
             self._json(404, {"error": "not found"})
             return
