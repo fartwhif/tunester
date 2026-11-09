@@ -2,7 +2,7 @@
 
 Docker pipeline: dirty song name → verified uncensored 160 kbps CBR MP3 in
 `downloads/` (container `/data`). CLI: `app.py "<query>"`; `pipeline.py`
-orchestrates, `sources.py` searches, `llm.py` wraps the llm1 chat API.
+orchestrates, `sources.py` searches, `llm.py` wraps the LLM chat APIs.
 
 ## Sources (priority order)
 1. **nzb.life / Usenet** (top priority). Account is **VIP membership**
@@ -290,15 +290,20 @@ timeout; results auto-deliver, never poll.
 
 ## LLM (prioritized failover list)
 `llm.py` tries backends in priority order per call; first valid
-response wins. Order (edit `_llm_endpoints()`): 1) **qwen38-27b**
-(llama.cpp edge `qwen38-27b.llmhost.example.com/v1`, model
-`/models/Qwen3.8-27B-UD-Q6_K_XL.gguf`, ~2-5 s/call) 2) **llm1**
-(env `OPENAI_*`; healthy ~9 s, observed 56-379 s under load 2026-09-27).
+response wins. Order (edit `_llm_endpoints()`): 1) **q38fa** (llama.cpp
+llmhost `llm2.example.com/v1`, model `q38fa-iq3_xxs-SC117_abl` — the
+qwen3.8-flash-next alias served as `qwen3.8-flash-next-iq3_xxs`,
+131k ctx; same provider/key as omp's `models.yml` `llmhost`, wired via
+`TUNESTER_LLM_PRIMARY_*` in `.env`; switched from the old
+qwen38-27b Q6_K GGUF primary 2026-11-08 after that endpoint + llm1
+both began 504-storming GrabbyTube's batch) 2) **llm1** (env
+`OPENAI_*`; healthy ~9 s, observed 56-379 s under load 2026-09-27).
 Non-final backend budget `FAILOVER_BUDGET`=90 s (hung endpoint); a dead
 endpoint (refused/DNS/reset, `_DEAD_REASONS`) fails over immediately;
 the last fallback keeps `LOAD_WAIT`=360 s cold-start wait.
-`CHAT_TIMEOUT`=240 s. All keys share one bearer (qwen reuses
-`OPENAI_API_KEY`). Gate degrades to filter-only if ALL backends fail.
+`CHAT_TIMEOUT`=240 s. The primary has its own bearer
+(`TUNESTER_LLM_PRIMARY_API_KEY`, falls back to `OPENAI_API_KEY`). Gate
+degrades to filter-only if ALL backends fail.
 - 2026-10-21: BOTH backends flaked mid-run (qwen38-27b exceeded the 90 s
   failover budget on a 12 s prompt; llm1 returned HTTP 504) and
   `discover` raised "all LLMs failed". A `--no-llm` run degrades to

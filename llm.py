@@ -7,7 +7,7 @@ Conventions follow MemeSeek (projects/MemeSeek/llm_client.py):
   budget, so the answer lands in the standard content field
 - the answer may still leak into reasoning_content; content is preferred
 
-Backends are tried in priority order (qwen38-27b, then llm1); the
+Backends are tried in priority order (q38fa on llm2, then llm1);
 first one to return a valid response wins.
 """
 import json
@@ -24,8 +24,8 @@ DEFAULT_MODEL = "llm1"
 THINK_BUDGET = int(os.getenv("TUNESTER_LLM_THINK_BUDGET", "100"))
 CHAT_TIMEOUT = int(os.getenv("TUNESTER_LLM_TIMEOUT", "240"))
 LOAD_WAIT = int(os.getenv("TUNESTER_LLM_LOAD_WAIT", "360"))
-PRIMARY_BASE_URL = "https://qwen38-27b.llmhost.example.com/v1"
-PRIMARY_MODEL = "/models/Qwen3.8-27B-UD-Q6_K_XL.gguf"
+PRIMARY_BASE_URL = "https://llm2.example.com/v1"
+PRIMARY_MODEL = "q38fa-iq3_xxs-SC117_abl"
 # max seconds on a non-final backend before failing over to the next one
 FAILOVER_BUDGET = int(os.getenv("TUNESTER_LLM_FAILOVER_WAIT", "90"))
 # connection errors that mean the endpoint is down, not just slow
@@ -96,7 +96,7 @@ def _llm_endpoints() -> list[LLMEndpoint]:
     """LLM backends in priority order; index 0 is tried first."""
     return [
         LLMEndpoint(
-            name="qwen38-27b",
+            name="q38fa",
             base_url=_env("TUNESTER_LLM_PRIMARY_BASE_URL", PRIMARY_BASE_URL),
             api_key=_env("TUNESTER_LLM_PRIMARY_API_KEY")
             or _env("OPENAI_API_KEY"),
