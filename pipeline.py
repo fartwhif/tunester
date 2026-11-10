@@ -9,6 +9,7 @@ Stages:
   5. name       "ARTIST - TITLE (YEAR).mp3", output re-verified against spec
 """
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,24 @@ from sources import (BROWSER_UA, HTTP_TIMEOUT, NNTP_HOST, NNTP_PASS,
 FFMPEG = os.environ.get("TUNESTER_FFMPEG", "ffmpeg")
 FFPROBE = os.environ.get("TUNESTER_FFPROBE", "ffprobe")
 OUTDIR_DEFAULT = Path(os.environ.get("TUNESTER_OUTDIR") or Path.cwd() / "downloads")
+
+# Two stores under one directory, neither of them under TUNESTER_OUTDIR: the
+# delivered files in /data stay the user's downloads, this is pipeline state
+# (compose binds the tunester-cache volume here; unset on a bare host ->
+# ~/.cache/tunester).
+#   deliveries/  the finished MP3, keyed on the song identity that was
+#                verified: a later tune of that same song is copied straight
+#                out and never searches or fetches again.
+#   sources/     the verified SOURCE bytes, keyed on (source URL, fetched
+#                file name): a later tune that selects the same candidate
+#                skips the fetch - the slow, quota-spending part of a run
+#                (the NNTP multi-part pull, yt-dlp, the archive.org GET).
+# Sources are cached raw, never as a re-encode, so a hit re-runs the gates
+# and the transcode and reproduces the delivery exactly.
+CACHE_DEFAULT = Path(os.environ.get("TUNESTER_CACHE")
+                     or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+                     / "tunester")
+CACHE_MAX_BYTES = int(os.environ.get("TUNESTER_CACHE_MAX_MB", "30720")) * 1024 * 1024
 TRIALS_PER_SOURCE = int(os.environ.get("TUNESTER_TRIALS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("TUNESTER_DOWNLOAD_TIMEOUT", "900"))
 
@@ -82,7 +101,7 @@ class Result:
     source: str
     url: str
     file: Path
-    gate: str  # "probe" | "duration" | "llm" | "filter-only"
+    gate: str  # "cache" | "probe" | "duration" | "acoustid" | "llm" | "filter-only"
     duration: float
 
 
@@ -93,6 +112,7 @@ class Options:
     source: str | None = None
     keep_source: bool = False
     use_llm: bool = True
+    use_cache: bool = True
 
 
 DISCOVER_SYSTEM = """You identify a single specific song from a user's rough, possibly dirty description
@@ -530,24 +550,411 @@ def probe(path: Path) -> dict | None:
     }
 
 
-def download(cand: Candidate, tmp: Path, cookies: Path | None,
-             target: Target, log) -> tuple[Path, str] | None:
-    """Download a candidate into tmp; return (file path, file name) or
-    None."""
-    if cand.source == "archive":
-        got = _download_http(cand, tmp, log)
-        if got is None:
+def _cache_dir(sub: str, log) -> Path | None:
+    """One subtree of the cache (`sources` / `deliveries`), or None when the
+    cache is unusable. A cache problem must never fail a tune."""
+    try:
+        d = CACHE_DEFAULT / sub
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError as e:
+        log(f"        cache dir {CACHE_DEFAULT / sub} unavailable: {e}")
+        return None
+
+
+def _cache_key(url: str, name: str) -> str:
+    """Key of one cached source file: sha1(source URL, fetched file name).
+
+    A nzb release URL serves several different songs (album rips, 12"
+    maxis), so the URL alone cannot identify bytes and the file's own name is
+    part of the key. Single-file sources (archive.org direct link, SoundCloud
+    /YouTube track page) pass name="", where the URL IS the whole identity.
+    Unlike a song-name key, this one is exact: what is stored under a key is
+    byte-identical to what that URL served, so re-running the gates and the
+    transcode on it reproduces the delivery exactly."""
+    return hashlib.sha1(f"{url}\x1f{name}".encode("utf-8")).hexdigest()
+
+
+def _cache_read(d: Path, key: str) -> tuple[Path, dict] | None:
+    """(blob, meta) of a cached source, or None. The JSON sidecar keeps the
+    source URL, the fetched file's name and its extension: the name is what
+    the QC gate judges on a multi-track release, and the extension is what
+    the video/audio handling keys off, so both must survive the cache."""
+    blob = d / f"{key}.bin"
+    try:
+        if blob.stat().st_size <= 1024:
             return None
-        return got, Path(urllib.parse.urlparse(cand.url).path).name
+        meta = json.loads((d / f"{key}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return blob, meta
+
+
+def _cache_hydrate(blob: Path, meta: dict, tmp: Path, log) -> Path | None:
+    """Copy a cached blob into tmp as src.<ext>, so the pipeline works on a
+    private file and can delete it (a rejected candidate is unlinked) without
+    ever touching the cache entry."""
+    ext = str(meta.get("ext") or "")
+    dst = tmp / (f"src.{ext}" if ext else "src")
+    try:
+        shutil.copyfile(blob, dst)
+        os.utime(blob, None)  # a hit refreshes the entry: LRU keeps what is used
+    except OSError as e:
+        log(f"        cache read failed: {e}")
+        return None
+    return dst
+
+
+def _cache_hit(url: str, name: str, tmp: Path, log) -> Path | None:
+    """Cached source bytes for (url, name) as a fresh file in tmp, or None
+    when uncached. The copy is ffprobe-checked first, so a damaged entry
+    costs a re-download instead of a bad delivery."""
+    d = _cache_dir("sources", log)
+    if d is None:
+        return None
+    rec = _cache_read(d, _cache_key(url, name))
+    if rec is None:
+        return None
+    blob, meta = rec
+    dst = _cache_hydrate(blob, meta, tmp, log)
+    if dst is None:
+        return None
+    if not probe(dst):
+        log("        cache entry not decodable - re-fetching")
+        _cache_drop(d, _cache_key(url, name))
+        dst.unlink(missing_ok=True)
+        return None
+    return dst
+
+
+def _cache_release_hit(url: str, target: Target, tmp: Path,
+                       log) -> tuple[Path, str] | None:
+    """Cache hit for a whole-release pluck, where the plucked file's name is
+    not yet known: scan the cache for a source recorded from this release URL
+    whose name contains the target title - exactly the file the pluck would
+    have selected. A different song from the same release is a miss."""
+    d = _cache_dir("sources", log)
+    if d is None:
+        return None
+    want = _norm(target.title)
+    best: tuple[tuple[int, int], dict, Path] | None = None
+    try:
+        metas = list(d.glob("*.json"))
+    except OSError:
+        return None
+    for mj in metas:
+        key = mj.stem
+        rec = _cache_read(d, key)
+        if rec is None:
+            continue
+        blob, meta = rec
+        name = str(meta.get("name") or "")
+        if meta.get("url") != url or not want or want not in _norm(name):
+            continue
+        ext = str(meta.get("ext") or "")
+        rank = ({"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
+                 "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0),
+                blob.stat().st_size)
+        if best is None or rank > best[0]:
+            best = (rank, meta, blob)
+    if best is None:
+        return None
+    _rank, meta, blob = best
+    name = str(meta.get("name") or "")
+    dst = _cache_hydrate(blob, meta, tmp, log)
+    if dst is None:
+        return None
+    if not probe(dst):
+        log("        cache entry not decodable - re-fetching")
+        _cache_drop(d, _cache_key(str(meta.get("url") or ""), name))
+        dst.unlink(missing_ok=True)
+        return None
+    log(f"        download cache hit: {name} "
+        f"({dst.stat().st_size // 1024} KB); whole-set NNTP fetch skipped")
+    return dst, name
+
+
+def _cache_drop(d: Path, key: str) -> None:
+    for p in (d / f"{key}.bin", d / f"{key}.json"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _blob_known(d: Path, key: str) -> bool:
+    """True when one cache entry is already published under `key`."""
+    try:
+        return (d / f"{key}.bin").stat().st_size > 1024
+    except OSError:
+        return False
+
+
+def _cache_write(d: Path, key: str, src: Path, meta: dict, log) -> bool:
+    """Publish one entry (blob + JSON sidecar) under `key`; False when
+    nothing was written.
+
+    Blob and sidecar go to temp files in the cache dir and are os.replace'd
+    onto their names: a run killed mid-copy, or two workers finishing the
+    same song at once, can never expose a partial blob, and a reader never
+    sees an entry half-mutated. A cache failure never fails the delivery."""
+    blob, side = d / f"{key}.bin", d / f"{key}.json"
+    if _blob_known(d, key):
+        return False  # already cached
+    tmp_blob = tmp_side = None
+    try:
+        fd, tmp_blob = tempfile.mkstemp(dir=str(d), prefix=key + ".",
+                                        suffix=".blob.part")
+        with os.fdopen(fd, "wb") as f:
+            with open(src, "rb") as fh:
+                shutil.copyfileobj(fh, f)
+        os.chmod(tmp_blob, 0o644)
+        fd, tmp_side = tempfile.mkstemp(dir=str(d), prefix=key + ".",
+                                        suffix=".json.part")
+        with os.fdopen(fd, "w") as f:
+            json.dump(meta, f)
+        os.replace(tmp_blob, blob)
+        tmp_blob = None
+        os.replace(tmp_side, side)
+        tmp_side = None
+    except OSError as e:
+        log(f"        cache write failed: {e}")
+        for stray in (tmp_blob, tmp_side):
+            if stray:
+                try:
+                    os.unlink(stray)
+                except OSError:
+                    pass
+        return False
+    _cache_evict(log)
+    return True
+
+
+def _cache_put(path: Path, url: str, name: str, log) -> None:
+    """Publish a verified source file under (url, name) so a later tune that
+    selects the same candidate skips the fetch."""
+    d = _cache_dir("sources", log)
+    if d is None:
+        return
+    key = _cache_key(url, name)
+    if _cache_write(d, key, path,
+                    {"url": url, "name": name,
+                     "ext": path.suffix.lstrip(".").lower()}, log):
+        log(f"        cached source {name or path.name} "
+            f"({(d / f'{key}.bin').stat().st_size // 1024} KB) -> {key[:12]}")
+
+
+def _cache_evict(log) -> None:
+    """Keep the cache under TUNESTER_CACHE_MAX_MB (default 30 GB), dropping
+    the least-recently-used entries first. Both subtrees count against the
+    cap and a hit refreshes an entry's mtime, so what is used survives.
+    Source files are big (a FLAC album pluck is tens to hundreds of MB), so
+    an unbounded store would eventually cost more than the fetches it
+    saves."""
+    try:
+        entries = {b: [b, b.with_suffix(".json")]
+                   for b in CACHE_DEFAULT.rglob("*.bin")}
+        files = [p for v in entries.values() for p in v if p.is_file()]
+        total = sum(p.stat().st_size for p in files)
+        if total <= CACHE_MAX_BYTES:
+            return
+        stale = sorted(
+            entries.items(),
+            key=lambda kv: max((p.stat().st_mtime for p in kv[1] if p.is_file()),
+                               default=0.0))
+    except OSError:
+        return
+    for blob, group in stale:
+        group = [p for p in group if p.is_file()]
+        freed = sum(p.stat().st_size for p in group)
+        for p in group:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        log(f"        cache over {CACHE_MAX_BYTES // (1024 * 1024)} MB: "
+            f"evicted {blob.stem[:12]} ({freed // (1024 * 1024)} MB)")
+        total -= freed
+        if total <= CACHE_MAX_BYTES:
+            return
+
+
+def _delivery_key(target: Target) -> str:
+    """Key of one verified delivery: sha1(normalized artist, normalized
+    title) - the song identity the gates actually verified.
+
+    The tag year is deliberately NOT part of it. Which year a pre-CD song
+    first appeared on CD is fuzzy and discovery does not answer it the same
+    way twice (observed: "Nena - 99 Luftballons" came back as 1983, 1984 and
+    1986 inside an hour, and the same song landed in `downloads/` three
+    times), so a year in the key would turn almost every repeat tune of a
+    pre-CD song into a fresh download. The year still rides in the sidecar
+    and is what the delivered file is named for (see `_delivery_get`)."""
+    return hashlib.sha1("\x1f".join([_norm(target.artist), _norm(target.title)])
+                        .encode("utf-8")).hexdigest()
+
+
+def _delivery_name(meta: dict, target: Target) -> str:
+    """Name a cached delivery is written out under: the name it was delivered
+    with, so the file name and its ID3 date always agree. Falls back to this
+    run's name for an entry whose sidecar has none."""
+    name = str(meta.get("name") or "") or target_filename(target)
+    return sanitize_name(Path(name).stem) + ".mp3"
+
+
+def _delivery_get(target: Target, outdir: Path,
+                  log) -> tuple[Path, dict, float] | None:
+    """Copy the stored delivery of `target` into `outdir` and return
+    (file, sidecar, duration), or None when uncached.
+
+    The bytes land on a temp name in the output dir and are only moved into
+    place once they pass the output spec again - so a corrupt or truncated
+    entry costs a full re-tune instead of a bad delivery (and the bad entry
+    is dropped). A hit writes the file the same way a fresh run would.
+    The duration is also compared with this run's MusicBrainz anchor: a
+    same-title entry that is a different cut (a 12" mix stored before the
+    anchor existed) is a miss, not a substitution."""
+    d = _cache_dir("deliveries", log)
+    if d is None:
+        return None
+    key = _delivery_key(target)
+    rec = _cache_read(d, key)
+    if rec is None:
+        return None
+    blob, meta = rec
+    dst = outdir / _delivery_name(meta, target)
+    part = dst.with_name(dst.name + ".tunester-part")
+    try:
+        shutil.copyfile(blob, part)
+    except OSError as e:
+        log(f"        cache copy failed: {e}")
+        part.unlink(missing_ok=True)
+        return None
+    problems = check_output(part, 0.0)
+    dur = (probe(part) or {}).get("duration", 0.0)
+    wrong_cut = (not problems and target.mb_duration and dur
+                 and abs(dur - target.mb_duration) > 15.0)
+    if problems or wrong_cut:
+        log("        cached delivery rejected - re-tuning: "
+            + ("; ".join(problems) if problems
+               else f"cached copy is {dur:.0f}s, this run's "
+                    f"MusicBrainz anchor is ~{target.mb_duration:.0f}s"))
+        part.unlink(missing_ok=True)
+        # Drop what the store cannot serve, so this run's verified delivery
+        # replaces it: a spec failure in the blob, or a stored cut that this
+        # run's duration anchor rules out, is no use to the next run either.
+        # A damaged COPY of a sound blob is the one case to keep - the entry
+        # is fine, only the read failed.
+        if not problems or check_output(blob, 0.0):
+            _cache_drop(d, key)
+        return None
+    try:
+        os.replace(part, dst)
+        os.utime(blob, None)  # a hit refreshes the entry: LRU keeps what is used
+    except OSError as e:
+        log(f"        cache copy failed: {e}")
+        part.unlink(missing_ok=True)
+        return None
+    return dst, meta, dur
+
+
+def _delivery_put(path: Path, target: Target, source: str, url: str,
+                  log) -> bool:
+    """Keep a copy of the finished MP3 under the song's identity, so the next
+    tune of that song is served from the store instead of hunting for and
+    re-encoding the recording all over again. True when a new entry was
+    written."""
+    d = _cache_dir("deliveries", log)
+    if d is None:
+        return False
+    meta = {"name": path.name, "artist": target.artist, "title": target.title,
+            "year": str(target.cd_year or target.year),
+            "source": source, "url": url}
+    if _cache_write(d, _delivery_key(target), path, meta, log):
+        log(f"        cached delivery {path.name}")
+        return True
+    return False
+
+
+DELIVERY_NAME_RE = re.compile(
+    r"^(?P<artist>.+) - (?P<title>.+?)(?: \((?P<year>\d{4})\))?\.mp3$")
+
+
+def seed_cache(outdir: Path, log=print) -> tuple[int, int, int]:
+    """Copy an already-delivered MP3 library into the store so those songs
+    never need fetching again. Only names that parse as the delivery name
+    ("ARTIST - TITLE (YEAR).mp3") and files that still pass the output check
+    are stored, so foreign MP3s in the output dir never enter the cache.
+    Files whose song is already in the store are counted separately, so a
+    second run says plainly that nothing new went in.
+    Returns (stored, skipped, already-stored)."""
+    d = _cache_dir("deliveries", log)
+    if d is None:
+        raise TuneError(f"cache dir {CACHE_DEFAULT / 'deliveries'} unusable")
+    try:
+        files = sorted(outdir.glob("*.mp3"))
+    except OSError as e:
+        raise TuneError(f"cannot read output dir {outdir}: {e}")
+    stored = skipped = known = 0
+    for f in files:
+        m = DELIVERY_NAME_RE.match(f.name)
+        if not m:
+            skipped += 1
+            log(f"  skip {f.name}: not an \"ARTIST - TITLE (YEAR).mp3\" name")
+            continue
+        target = Target(m["artist"], m["title"], year=m["year"] or "")
+        if _blob_known(d, _delivery_key(target)):
+            known += 1
+            continue
+        problems = check_output(f, 0.0)
+        if problems:
+            skipped += 1
+            log(f"  skip {f.name}: " + "; ".join(problems))
+            continue
+        if _delivery_put(f, target, "", "", log):
+            stored += 1
+        else:
+            skipped += 1
+    return stored, skipped, known
+
+
+def _archive_file_name(cand: Candidate) -> str:
+    """File name an archive.org direct-link candidate serves, read from its
+    URL path. Part of the cache identity so a put and its later lookup use the
+    same key (the URL alone already identifies the bytes)."""
+    return Path(urllib.parse.urlparse(cand.url).path).name
+
+
+def download(cand: Candidate, tmp: Path, cookies: Path | None,
+             target: Target, log, use_cache: bool = True) -> tuple[Path, str] | None:
+    """Fetch a candidate into tmp (served from the download cache when it holds
+    this source); return (file path, file name) or None. The file name is the
+    per-file name the QC gate judges on a multi-track release, and is also the
+    name part of the cache identity for that source."""
+    if cand.source == "archive":
+        name = _archive_file_name(cand)
+        got = _download_http(cand, tmp, log, name, use_cache)
+        return (got, name) if got else None
     if cand.source == "nzb":
-        return _download_nzb(cand, tmp, target, log)
-    got = _download_yt(cand, tmp, cookies, log)
+        return _download_nzb(cand, tmp, target, log, use_cache)
+    got = _download_yt(cand, tmp, cookies, log, use_cache)
     return (got, "") if got else None
 
 
-def _download_yt(cand: Candidate, tmp: Path, cookies: Path | None, log) -> Path | None:
+def _download_yt(cand: Candidate, tmp: Path, cookies: Path | None, log,
+                 use_cache: bool = True) -> Path | None:
     for old in tmp.glob("src.*"):
         old.unlink(missing_ok=True)
+    # One URL is one track for yt-dlp, so the URL alone identifies it. A hit
+    # also skips the simulate precheck: the preview-only/short-upload checks
+    # are what qualified this blob for the cache in the first place.
+    if use_cache:
+        got = _cache_hit(cand.url, "", tmp, log)
+        if got is not None:
+            log(f"        download cache hit ({got.stat().st_size // 1024} KB)")
+            return got
     flags = ["--no-playlist", "-f", "ba/b", "--no-write-thumbnail",
              "--no-write-info-json", "--no-write-subs", "--no-warnings"]
     if cand.source.startswith("yt") and cookies:
@@ -602,9 +1009,17 @@ def _download_yt(cand: Candidate, tmp: Path, cookies: Path | None, log) -> Path 
     return files[0]
 
 
-def _download_http(cand: Candidate, tmp: Path, log) -> Path | None:
+def _download_http(cand: Candidate, tmp: Path, log, name: str,
+                   use_cache: bool = True) -> Path | None:
     for old in tmp.glob("src.*"):
         old.unlink(missing_ok=True)
+    # One URL is one file on archive.org, so the URL alone identifies it; the
+    # URL-derived name rides along as the (stable) identity name.
+    if use_cache:
+        got = _cache_hit(cand.url, name, tmp, log)
+        if got is not None:
+            log(f"        download cache hit ({got.stat().st_size // 1024} KB)")
+            return got
     ext = Path(urllib.parse.urlparse(cand.url).path).suffix.lower() or ".mp3"
     dst = tmp / f"src{ext}"
     log(f"        downloading {cand.url}")
@@ -821,7 +1236,7 @@ def _nzb_album_cands(target: Target, seen: set[str],
 
 
 def _download_nzb(cand: Candidate, tmp: Path, target: Target,
-                  log) -> tuple[Path, str] | None:
+                  log, use_cache: bool = True) -> tuple[Path, str] | None:
     """Fetch an nzb.life release over NNTP; return (path, file name),
     or None. A video file is used when the release has no pure-audio
     file (audio extracted at transcode)."""
@@ -854,7 +1269,7 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
             video.append((name, ext, grp, segs))
     pool = audio or video
     if not pool:
-        return _nzb_archive_pluck(files, tmp, target, log)
+        return _nzb_archive_pluck(files, cand.url, tmp, target, log, use_cache)
 
     bad = make_bad_filter(target.artist)
     ranked = []
@@ -876,6 +1291,12 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
     # B-sides are different songs.
     final = [r for r in ranked if r[0] == top_hit]
     _, _, _, (name, ext, grp, segs) = max(final, key=lambda r: (r[1], r[2]))
+    if use_cache:
+        got = _cache_hit(cand.url, name, tmp, log)
+        if got is not None:
+            log(f"        download cache hit: {name} "
+                f"({got.stat().st_size // 1024} KB); NNTP fetch skipped")
+            return got, name
     if ext in NZB_VIDEO_EXTS:
         log(f"        NNTP fetch: {name} ({len(segs)} parts; video, "
             f"audio only transcoded)")
@@ -921,13 +1342,23 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
     return out, name
 
 
-def _nzb_archive_pluck(files, tmp: Path, target: Target,
-                       log) -> tuple[Path, str] | None:
+def _nzb_archive_pluck(files, url: str, tmp: Path, target: Target,
+                       log, use_cache: bool = True) -> tuple[Path, str] | None:
     """The release has no bare media file: the audio is inside an archive
     (RAR/zip/7z) with recovery/parity files. Fetch the whole set over NNTP,
     verify (and repair) with par2 when present, extract with unar, then
     pluck the track with the same title-hit/format/size ranking as the
     bare-file path."""
+    # Release-level cache: the plucked track is a deterministic function of
+    # this release + the target title, so a track already plucked (and
+    # verified) from this URL replays with identical bytes. The plucked file
+    # name is only known after extraction, so the lookup matches on the
+    # recorded release URL plus the same title-hit rule the pluck applies -
+    # another song from the same album never reuses this entry.
+    if use_cache:
+        got = _cache_release_hit(url, target, tmp, log)
+        if got is not None:
+            return got
     total = sum(b for _s, _g, segs in files for _, b in segs)
     if total > NZB_MAX_ARCHIVE:
         log(f"        archive release too large: {total / 1e6:.0f} MB > "
@@ -1303,6 +1734,26 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
     except PermissionError as e:
         raise TuneError(f"cannot create output dir {outdir}: {e}", target=target)
     dst = outdir / target_filename(target)
+
+    # Already in the store? Then this song was found, verified and encoded
+    # once: hand the same file back and skip the search, the fetch and the
+    # transcode. The stored name wins over this run's guess at the tag year
+    # (the key is artist+title precisely because that year is fuzzy), and the
+    # copy is re-checked against the output spec before it lands anywhere.
+    if opts.use_cache:
+        hit = _delivery_get(target, outdir, log)
+        if hit is not None:
+            dst, meta, dur = hit
+            log(f"[2/5] cache hit: {target.artist} - {target.title} is already "
+                f"in the store - no search, no fetch, no transcode")
+            log(f"      from {meta.get('source') or 'a previous run'}: "
+                f"{meta.get('url') or ''}")
+            log(f"[5/5] done -> {dst}")
+            return Result(target.artist, target.title,
+                          str(meta.get("year") or tag_year),
+                          str(meta.get("source") or ""),
+                          str(meta.get("url") or ""), dst, "cache", dur)
+
     tmp = Path(tempfile.mkdtemp(prefix="tunester-"))
     sources = [s for s in SOURCES if not opts.source or s.id == opts.source]
 
@@ -1336,7 +1787,7 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
             for cand in usable[:TRIALS_PER_SOURCE]:
                 log(f"      try: {cand.title!r} <- {cand.uploader or '?'}")
                 try:
-                    got = download(cand, tmp, cookies, target, log)
+                    got = download(cand, tmp, cookies, target, log, opts.use_cache)
                 except Exception as e:
                     log(f"      download failed: {e}")
                     continue
@@ -1364,6 +1815,11 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
                     dst.unlink(missing_ok=True)
                     path.unlink(missing_ok=True)
                     continue
+                if opts.use_cache:
+                    # Only what passed every gate is stored, so neither store
+                    # ever accumulates previews or mislabeled junk.
+                    _cache_put(path, cand.url, fname, log)
+                    _delivery_put(dst, target, cand.source, cand.url, log)
                 out_info = probe(dst) or {}
                 log(f"[5/5] done -> {dst}")
                 return Result(target.artist, target.title,

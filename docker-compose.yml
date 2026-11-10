@@ -8,6 +8,9 @@ services:
       - "8102:8102"
     volumes:
       - ./downloads:/data
+      # Reuse store for verified deliveries; deliberately not under /data
+      # (the downloads volume) so downloads stay the user's files.
+      - tunester-cache:/cache
       - ../ytcookies/data:/shared-cookies
       - .env:/app/.env:ro
       - ./wireguard/wg0.conf.template:/etc/wireguard/wg0.conf.template:ro
@@ -23,3 +26,6 @@ services:
 networks:
   shared:
     external: true
+
+volumes:
+  tunester-cache:

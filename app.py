@@ -6,6 +6,7 @@ Output spec: MP3 160 kbps CBR / 44.1 kHz / stereo, named "ARTIST - TITLE (YEAR).
 Usage:
   python3 app.py "that screaming song about war" [-o OUTDIR] [options]
   python3 app.py --serve [--host 0.0.0.0] [--port 8102]
+  python3 app.py --seed-cache [-o OUTDIR]
 """
 import argparse
 import json
@@ -13,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-from pipeline import Options, TuneError, tune
+from pipeline import Options, TuneError, seed_cache, tune
 from sources import SOURCES
 
 
@@ -33,6 +34,10 @@ def main(argv=None) -> int:
                     help="keep the downloaded source file")
     ap.add_argument("--no-llm", action="store_true",
                     help="skip LLM discovery + QC gate (heuristic parse, filter-only verify)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore the verified-download cache and do not add this run's file to it")
+    ap.add_argument("--seed-cache", action="store_true",
+                    help="copy the verified MP3s already in the output dir into the cache, then exit")
     ap.add_argument("--json", action="store_true",
                     help="print a JSON result object on success")
     ap.add_argument("--serve", action="store_true",
@@ -48,8 +53,19 @@ def main(argv=None) -> int:
         web.serve(args.host, args.port, outdir)
         return 0
 
+    if args.seed_cache:
+        try:
+            stored, skipped, known = seed_cache(
+                args.outdir if args.outdir else Options().outdir)
+        except TuneError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"cache seeded: {stored} stored, {skipped} skipped, "
+              f"{known} already in the store")
+        return 0
+
     if not args.name:
-        ap.error("a dirty song name is required (or use --serve)")
+        ap.error("a dirty song name is required (or use --serve or --seed-cache)")
 
     opts = Options()
     if args.outdir:
@@ -58,6 +74,7 @@ def main(argv=None) -> int:
     opts.source = args.source
     opts.keep_source = args.keep_source
     opts.use_llm = not args.no_llm
+    opts.use_cache = not args.no_cache
 
     try:
         res = tune(args.name, opts)

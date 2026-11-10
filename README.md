@@ -68,6 +68,35 @@ NZBs), because the original album is the canonical source; direct search hits
 are the fallback. Archive RAR/par2 releases are fetched whole, repaired and
 extracted (`unar`, `par2`) before the track is plucked.
 
+## Reuse store
+
+Nothing is fetched, verified or encoded twice. Every file that passes the QC
+gate and every finished MP3 is copied into a cache (`TUNESTER_CACHE`, the
+container's `tunester-cache` volume — deliberately *not* under the output
+dir, so `downloads/` stays nothing but delivered files), keyed two ways:
+
+- **source entries** — source URL + fetched file name. A hit skips the NNTP
+  pull or HTTP fetch; the copy is ffprobe-checked and then runs the whole QC
+  gate again, so a damaged entry costs a re-download, never a bad delivery.
+  A whole-release pluck hits on the plucked track's own cached file instead of
+  re-fetching the entire RAR set.
+- **delivery entries** — normalized artist + title, the identity the gates
+  actually verified. A hit skips the search, the fetch, the gates and the
+  transcode: the song was already found and verified once, so the stored copy
+  is handed back after one output-spec re-check plus a duration comparison
+  with this run's MusicBrainz anchor (`Result.gate`, reported as
+  `gate: "cache"` by `--json`). The tag year is *not* in the key — which year
+  a pre-CD song first appeared on CD is fuzzy and discovery does not answer it
+  the same way twice — and a hit is written out under the stored entry's own
+  name (its year included), so a recording the store already served never
+  lands a second time under a second year.
+
+`TUNESTER_CACHE_MAX_MB` (30 GB) caps both stores; the least-recently-used
+entries are evicted first and a hit counts as use. Nothing about the cache
+can fail a tune: an unwritable directory or a corrupt entry degrades to
+fetching and verifying normally. `--seed-cache` indexes an existing
+`downloads/` into the store so songs already delivered never need fetching.
+
 ## CLI
 
 ```
@@ -76,6 +105,7 @@ python3 app.py "that screaming song about war" -o /tmp/out --json
 python3 app.py "Beck - Loser" --source nzb --keep-source
 python3 app.py "Men Without Hats - Safety Dance" --no-llm
 python3 app.py --serve --host 0.0.0.0 --port 8102
+python3 app.py --seed-cache            # index ./downloads into the reuse store
 ```
 
 | flag | meaning |
@@ -85,6 +115,8 @@ python3 app.py --serve --host 0.0.0.0 --port 8102
 | `--source nzb\|archive\|soundcloud` | one source instead of the fallback chain |
 | `--keep-source` | do not delete the run's temp working directory, so the downloaded source file (…/`tunester-XXXX`/`src.*`) can be inspected |
 | `--no-llm` | skip LLM discovery and the LLM gate: discovery is a plain `Artist - Title` parse (free-form descriptions fail with `TuneError` — without the model there is nothing to resolve them), and verification runs probe/duration/AcoustID only. The version gate is the sole defense against a clean-titled cover/karaoke, so it is off |
+| `--no-cache` | ignore the reuse store for this run and do not add its file to it |
+| `--seed-cache` | copy the verified MP3s already in the output dir into the reuse store (names that do not parse as `ARTIST - TITLE (YEAR).mp3`, and files failing the output spec, are skipped), then exit |
 | `--json` | print the result object (`artist`/`title`/`year`/`source`/`url`/`file`/`gate`/`duration`) |
 
 `TuneError` prints `error: <reason>` on stderr and exits non-zero. The status
@@ -127,6 +159,8 @@ to start — missing optional settings simply disable their feature.
 | `TUNESTER_LLM_TIMEOUT` / `_LOAD_WAIT` / `_FAILOVER_WAIT` / `_THINK_BUDGET` | `240` / `360` / `90` / `100` | per-request timeout, cold-start wait allowed for the last endpoint, budget for a hung non-final one, thinking-token budget |
 | `TUNESTER_ACOUSTID_KEY` | unset | enables the AcoustID content gate (free key at acoustid.org; needs `fpcalc`, shipped in the image). `TUNESTER_ACOUSTID_MIN_CONF` (0.7) is the score at which a confident identification of a *different* recording rejects |
 | `TUNESTER_OUTDIR` | `./downloads` | output directory (the container uses `/data`) |
+| `TUNESTER_CACHE` | `$XDG_CACHE_HOME/tunester` | reuse store root (`$HOME/.cache/tunester` when XDG is unset); the container uses the `tunester-cache` volume at `/cache` |
+| `TUNESTER_CACHE_MAX_MB` | `30720` | cap on the reuse store; LRU entries are evicted first (a hit counts as use) |
 | `TUNESTER_WEB_HOST` / `TUNESTER_WEB_PORT` | `0.0.0.0` / `8102` | `--serve` bind |
 | `TUNESTER_TRIALS` | `5` | candidates tried per source |
 | `TUNESTER_SEARCH_DEPTH` | `15` | results requested per yt-dlp query (SoundCloud; nzb.life/archive.org have their own fixed result windows) |
@@ -160,8 +194,11 @@ curl -s -X POST localhost:8102/api/tune -d '{"name":"Peter Gabriel - Sledgehamme
 curl -s localhost:8102/api/jobs
 ```
 
-`./downloads` is mounted at `/data` (MP3 output + the NZB cache),
-`../ytcookies/data` at `/shared-cookies`, and `.env` read-only at `/app/.env`.
+`./downloads` is mounted at `/data` (MP3 output), the named volume
+`tunester-cache` at `/cache` (reuse store), `../ytcookies/data` at
+`/shared-cookies`, and `.env` read-only at `/app/.env`. The NZB cache stays
+under `/data/.nzb-cache`.
+
 The container needs `NET_ADMIN` + `net.ipv4.conf.all.src_valid_mark=1` for the
 tunnel; the entrypoint also pins the docker bridge subnet onto `eth0` in table
 `51820` so the full-tunnel route table does not swallow replies from sibling

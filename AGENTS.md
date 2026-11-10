@@ -4,6 +4,46 @@ Docker pipeline: dirty song name → verified uncensored 160 kbps CBR MP3 in
 `downloads/` (container `/data`). CLI: `app.py "<query>"`; `pipeline.py`
 orchestrates, `sources.py` searches, `llm.py` wraps the LLM chat APIs.
 
+## Reuse store (2026-11-10)
+`TUNESTER_CACHE` (container: named volume `tunester-cache` at `/cache` —
+**not** under `/data`, so `downloads/` stays purely the user's delivered
+files) holds two subtrees, each `<sha1>.bin` + a `<sha1>.json` sidecar,
+written blob-then-sidecar via `os.replace` so no reader ever sees a partial
+entry (`_cache_write`):
+- `sources/` — key `sha1(source URL, fetched file name)` (URL alone for
+  archive.org/SoundCloud, where `name=""`). Skips the fetch; the hydrated
+  copy is ffprobe-checked and then runs the FULL gate + transcode again, so
+  the cache never changes what gets delivered. `_cache_release_hit` covers
+  whole-RAR plucks: it scans sidecars for this release URL + a name
+  containing the target title (the same file the pluck would have picked),
+  so a different track from the same release is a miss.
+- `deliveries/` — key `sha1(_norm(artist), _norm(title))`, i.e. the song
+  identity the gates verified. **The tag year is NOT in the key**: which year
+  a pre-CD song first hit CD is fuzzy and `discover` does not answer it the
+  same way twice (observed: "Nena - 99 Luftballons" → 1983, 1984 and 1986
+  inside an hour, landing three copies in `downloads/`), so a year-keyed
+  store re-downloaded the same recording on nearly every repeat. The year is
+  in the sidecar and drives the file name: on a hit the **stored** name is
+  used (`_delivery_name`), so file name and ID3 date always agree. Hit =
+  search/fetch/gates/transcode all skipped; the copy is verified by
+  `check_output` plus a ±15 s comparison against this run's `mb_duration`
+  anchor before it lands (a same-title entry that is a different cut is a
+  miss, not a substitution; `Result.gate == "cache"`). A spec failure or a
+  ruled-out cut drops the entry so the fresh delivery replaces it; a bad
+  *copy* of a sound blob is kept. Seeded from `downloads/` by
+  `app.py --seed-cache` (parses `ARTIST - TITLE (YEAR).mp3` names, runs
+  `check_output` on each, counts stored / skipped / already-in-store).
+  Known limit of the exact-title key: a parenthetical **subtitle** the LLM
+  includes or drops run to run ("I Wanna Dance with Somebody" vs "(Who Loves
+  Me)", 2026-11-10) is a separate entry and a second file. Dropping paren
+  groups from the key is NOT safe — "(Live at …)", "(Reprise)" and a genuine
+  B-side live there.
+`--no-cache` = `Options.use_cache=False` skips reads AND writes in both
+stores. `_cache_evict` caps both subtrees at `TUNESTER_CACHE_MAX_MB`
+(default 30720) by entry mtime; a hit refreshes mtime so used entries
+survive. Every cache failure (unwritable dir, corrupt blob/sidecar, copy
+error) logs and returns a miss — a cache problem NEVER fails a tune.
+
 ## Sources (priority order)
 1. **nzb.life / Usenet** (top priority). Account is **VIP membership**
    (363 days left as of 2026-09-29): no free-tier getnzb quota to conserve. `getnzb`
