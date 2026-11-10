@@ -49,8 +49,9 @@ ACOUSTID_HOST = os.environ.get("TUNESTER_ACOUSTID_HOST", "api.acoustid.org")
 ACOUSTID_MIN_CONF = float(os.environ.get("TUNESTER_ACOUSTID_MIN_CONF", "0.7"))
 
 COOKIES_CANDIDATES = [
-    Path("/shared-cookies/cookies.txt"),                    # container shared mount
-    Path("/home/user/projects/ytcookies/data/cookies.txt"),  # host-side export
+    Path("/shared-cookies/cookies.txt"),  # container shared mount (compose)
+    # host-side run: the sibling ytcookies export, relative to this repo
+    Path(__file__).resolve().parent.parent / "ytcookies" / "data" / "cookies.txt",
     Path("data/cookies.txt"),
 ]
 

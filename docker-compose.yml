@@ -8,7 +8,7 @@ services:
       - "8102:8102"
     volumes:
       - ./downloads:/data
-      - /home/user/projects/ytcookies/data:/shared-cookies
+      - ../ytcookies/data:/shared-cookies
       - .env:/app/.env:ro
       - ./wireguard/wg0.conf.template:/etc/wireguard/wg0.conf.template:ro
     cap_add:

@@ -19,13 +19,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_BASE_URL = "https://llm1.llmhost.example.com/v1"
-DEFAULT_MODEL = "llm1"
+# Endpoints are deployment config, so nothing is hardcoded: base URLs and
+# model ids come from .env / the environment (see _llm_endpoints). An unset
+# base URL drops that backend entirely.
+DEFAULT_BASE_URL = ""
+DEFAULT_MODEL = ""
 THINK_BUDGET = int(os.getenv("TUNESTER_LLM_THINK_BUDGET", "100"))
 CHAT_TIMEOUT = int(os.getenv("TUNESTER_LLM_TIMEOUT", "240"))
 LOAD_WAIT = int(os.getenv("TUNESTER_LLM_LOAD_WAIT", "360"))
-PRIMARY_BASE_URL = "https://llm2.example.com/v1"
-PRIMARY_MODEL = "q38fa-iq3_xxs-SC117_abl"
+PRIMARY_BASE_URL = ""
+PRIMARY_MODEL = ""
 # max seconds on a non-final backend before failing over to the next one
 FAILOVER_BUDGET = int(os.getenv("TUNESTER_LLM_FAILOVER_WAIT", "90"))
 # connection errors that mean the endpoint is down, not just slow
@@ -93,22 +96,25 @@ class LLMEndpoint:
 
 
 def _llm_endpoints() -> list[LLMEndpoint]:
-    """LLM backends in priority order; index 0 is tried first."""
-    return [
+    """LLM backends in priority order; index 0 is tried first. A backend
+    whose base URL is not configured (env / .env) is dropped, so a machine
+    with only one backend up declares only that one."""
+    eps = [
         LLMEndpoint(
-            name="q38fa",
+            name="primary",
             base_url=_env("TUNESTER_LLM_PRIMARY_BASE_URL", PRIMARY_BASE_URL),
             api_key=_env("TUNESTER_LLM_PRIMARY_API_KEY")
             or _env("OPENAI_API_KEY"),
             model=_env("TUNESTER_LLM_PRIMARY_MODEL", PRIMARY_MODEL),
         ),
         LLMEndpoint(
-            name="llm1",
+            name="fallback",
             base_url=_env("OPENAI_BASE_URL", DEFAULT_BASE_URL),
             api_key=_env("OPENAI_API_KEY"),
             model=_env("TUNESTER_LLM_MODEL", DEFAULT_MODEL),
         ),
     ]
+    return [e for e in eps if e.base_url]
 
 
 class LLM:
