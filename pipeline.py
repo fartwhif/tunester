@@ -328,12 +328,23 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
                 log(f"      search year {year} (LLM guess) -> {mb_year} "
                     f"(first studio album, MusicBrainz)")
             year = str(mb_year)
-    if not album or _mb_release_exists(artist, album, log) is False:
-        # An LLM album MusicBrainz refutes is often a label name or a
-        # wrong guess (qwen said "Ruckus" for Men Without Hats); the
-        # album query - how original-album CD rips are found - is only
-        # as good as this string, so re-derive it from the MB tally.
-        album = musicbrainz_album(artist, title, year, log) or album
+    # The tally - the release title carrying the most pressings of
+    # exact-title recordings, live groups excluded - IS "the original
+    # album the song first appeared on" by construction: only albums the
+    # recording actually appears on are tallied. It therefore beats the
+    # LLM's guess whenever MB returns one, and by a robust margin:
+    # "release titled X exists" (the old check) cannot catch a WRONG-BUT-
+    # EXISTING album, e.g. the LLM put "Just Another Day" on "Weird
+    # Science" - the OST is a real Oingo Boingo release, so exists()
+    # passed, yet it never contained the song, the album pluck found
+    # nothing, and only SoundCloud uploads were left. An empty tally
+    # (standalone single, API failure) keeps the LLM's album.
+    mb_album = musicbrainz_album(artist, title, year, log)
+    if mb_album:
+        if album and _norm(album) != _norm(mb_album):
+            log(f"      album {album!r} (guess) -> {mb_album!r} "
+                f"(most-pressed, MusicBrainz)")
+        album = mb_album
     # The tag year is the first standard CD release year: CD-era rips
     # of a pre-CD album carry the CD pressing's date, not the studio
     # year (Men Without Hats "Rhythm of Youth": 1982 vinyl, 1984
@@ -349,7 +360,11 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     # stop running and every song fall back to concert tapers.
     target = Target(artist, title, year, album=album)
     target.cd_year = cd_year
-    target.mb_duration = musicbrainz_duration(artist, title, year, log)
+    # Album first: the derived original album is what defines "the
+    # standard CD version", and the recording median below is out-voted
+    # by radio-edit reissues (see musicbrainz_duration).
+    target.mb_duration = musicbrainz_duration(artist, title, year, log,
+                                              album=album)
     if target.mb_duration:
         log(f"      duration anchor (MusicBrainz): {target.mb_duration:.0f}s")
     if cd_year and cd_year != year:
@@ -476,23 +491,72 @@ def musicbrainz_studio_year(artist: str, title: str,
 
 
 def musicbrainz_duration(artist: str, title: str, year: str,
-                         log=print) -> float:
+                         log=print, album: str = "") -> float:
     """Canonical studio length (seconds) from MusicBrainz, 0.0 when it
     cannot be established.
 
-    Only recordings whose title is exactly the target (no parenthesised
-    version suffix) count - MB indexes every remix/edit as its own
-    recording, and those outnumber the studio cut. With a known year the
-    cluster must be dated within ±1/±3 of it: an undated or remix-era
-    length is NOT the studio length, so the gate is skipped (0.0) rather
-    than trust it."""
+    With a known album, anchor on the length the track carries on that
+    album's pressings - "the standard CD version" literally. The
+    recording-median below is NOT safe when a shorter single/radio edit
+    exists: the edit is reissued on dozens of compilations that out-vote
+    the handful of album pressings (Weird Science: the 368 s album cut
+    on Dead Man's Party pressings vs a 229 s edit on ~25 compilation
+    releases - the median picked 229 s and vetoed every genuine album
+    rip). An original-album pressing IS the standard cut, so ONE such
+    length is already decisive; the within-15s cluster only adds
+    robustness across pressings. Live release-groups are excluded (the
+    album query feeds on the same album, and its live siblings -
+    "Boingo Alive" - carry long takes).
+
+    Without an album (or when no pressing reports a length), fall back
+    to recording-level clusters: only recordings whose title is exactly
+    the target (no parenthesised version suffix) count - MB indexes
+    every remix/edit as its own recording. With a known year the cluster
+    must be dated within ±1/±3 of it: an undated or remix-era length is
+    NOT the studio length, so the gate is skipped (0.0) rather than
+    trust it."""
+    a, t = _norm(artist), _norm(title)
+    if album:
+        al = _norm(album)
+        q = urllib.parse.urlencode({
+            "query": f'recording:"{title}" AND artist:"{artist}"',
+            "fmt": "json", "limit": 60, "inc": "releases"})
+        data = _mb_get(f"/recording?{q}", log)
+        lens: list[int] = []
+        for r in (data or {}).get("recordings", []):
+            if _norm(str(r.get("title") or "")) != t:
+                continue
+            ac = _norm(" ".join(x.get("name", "")
+                                for x in r.get("artist-credit", [])))
+            if not (a in ac or ac in a):
+                continue
+            for rel in r.get("releases") or []:
+                if _norm(str(rel.get("title") or "")) != al:
+                    continue
+                rg = rel.get("release-group") or {}
+                if str(rg.get("primary-type") or "").lower() == "live" or any(
+                        str(s).lower() == "live"
+                        for s in (rg.get("secondary-types") or [])):
+                    continue
+                for media in rel.get("media") or []:
+                    for tr in media.get("track") or []:
+                        if _norm(str(tr.get("title") or "")) == t and tr.get("length"):
+                            try:
+                                lens.append(int(tr["length"]) // 1000)
+                            except (TypeError, ValueError):
+                                pass
+        m = _cluster_median([float(x) for x in lens])
+        if m:
+            return m
+        if lens:
+            lens.sort()
+            return float(lens[len(lens) // 2])
     q = urllib.parse.urlencode({
         "query": f'recording:"{title}" AND artist:"{artist}"',
         "fmt": "json", "limit": 30})
     data = _mb_get(f"/recording?{q}", log)
     if not data:
         return 0.0
-    a, t = _norm(artist), _norm(title)
     dated: list[tuple[int | None, int]] = []
     for r in data.get("recordings", []):
         try:
@@ -520,26 +584,6 @@ def musicbrainz_duration(artist: str, title: str, year: str,
                 return m
         return 0.0
     return _cluster_median([L for _, L in dated])
-
-
-def _mb_release_exists(artist: str, album: str, log) -> bool | None:
-    """True/False when MusicBrainz confirms/refutes a release titled
-    `album` by `artist`; None on API failure (a failure is not a
-    refutation - keep the LLM's album then)."""
-    q = urllib.parse.urlencode({
-        "query": f'release:"{album}" AND artist:"{artist}"',
-        "fmt": "json", "limit": 10})
-    data = _mb_get(f"/release?{q}", log)
-    if data is None:
-        return None
-    a, t = _norm(artist), _norm(album)
-    for r in data.get("releases", []):
-        rt = _norm(str(r.get("title") or ""))
-        ac = _norm(" ".join(x.get("name", "")
-                            for x in r.get("artist-credit", [])))
-        if rt == t and (a in ac or ac in a):
-            return True
-    return False
 
 
 def musicbrainz_album(artist: str, title: str, year: str = "",

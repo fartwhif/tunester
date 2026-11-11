@@ -289,11 +289,15 @@ Early-return on the first verified release caps quota spend.
   excluding titles equal to the song (the single = the 12" false front),
   preferring a +/-1-year window when the year is known. Beck -> Mellow
   Gold; Sledgehammer/Big Time -> So; One Step Closer -> Hybrid Theory.
-  2026-10-21: a NON-empty LLM album is also checked - `_mb_release_exists`
-  asks MB whether the artist has a release by that name, and a REFUTED
-  album (qwen returned "Ruckus", the label, for Men Without Hats) is
-  re-derived from the tally above, since the album query is how original-
-  album CD rips are found. An API failure (None) keeps the LLM's album.
+  2026-11-10: the tally WINS whenever it returns a title — `_mb_release_exists`
+  ("artist has SOME release named X") is deleted: it could not catch a
+  wrong-but-existing album. The LLM put "Just Another Day" on "Weird
+  Science" — the OST is a real Oingo Boingo release, exists() passed, yet
+  it never contained the song: the album pluck found nothing and only
+  distorted SoundCloud uploads were left. The tally only counts albums
+  the exact-title recording ACTUALLY appears on, so an empty LLM album
+  or any wrong guess yields to it; only an EMPTY tally (standalone
+  single, API failure) keeps the LLM's album.
 
 - All LLM prompts (system + user) are appended to the status ticker via
   `LLM(log=...)` inside `chat()` — single choke point; both the discover
@@ -345,9 +349,16 @@ delivered files proved four distinct leaks, each needing its own fix:
   query strings only; the stored album keeps it (compared only via `_norm`).
   Apostrophe-free albums (`Nothing to Fear`, `Only a Lad`) were always fine
   — which is why non-`Dead Man's Party` Boingo songs already delivered right.
-`Weird Science` (138.4 s) is a separate wrong-version: the studio SINGLE/radio
-edit (~2:18), which the duration anchor now vetoes against the 229 s album cut
-that `02-dead-mans-party`/`dmp-remastered` carry.
+`Weird Science` is the anchor bug, not a search failure. It has TWO 1985
+studio recordings: the album cut (~368 s, MB recording `0e84643f`, which
+`Dead Man's Party` pressings carry at 367–368 s — the scene EOS rip and
+`02-dead-mans-party`'s flac/mp3 all match) and a ~229 s radio edit
+(`dfa94921`) that only ever appears on compilations/soundtracks, never as
+the DMP album track. The recording-median anchor locked on 229 s (the edit
+is reissued on ~25 compilations that out-vote the handful of album
+pressings) and VETOED every genuine 368 s album rip as "too long"; the
+138 s that shipped was a SoundCloud remix. See the album-pressing anchor
+fix below.
 
 - **The typed-year pin does NOT cover the real GrabbyTube flow, which
   sends NO year.** `GrabbyTube/tunester.py:104` submits exactly
@@ -399,6 +410,21 @@ that `02-dead-mans-party`/`dmp-remastered` carry.
   off 429/5xx up to 4 times so the album backfill survives load; it was
   NOT the cause of the empty album (that was the slot bug above) — the
   429 explanation was a false lead this session's probes disproved.
+- **The duration anchor is album-anchored, not recording-median.**
+  `musicbrainz_duration(artist, title, year, log, album=)` now takes the
+  length the track carries on pressings of the DERIVED original album
+  (non-live release-groups only) — literally "the standard CD version".
+  One such length is already decisive (an original pressing IS the
+  standard cut); the within-15 s cluster only adds robustness across
+  pressings, and it falls back to the old recording-level median when
+  the album reports no track lengths. The recording median alone was the
+  Weird Science veto above (229 s radio-edit cluster vs 368 s album cut)
+  and also mis-anchored Wild Sex at 257 s (1984 single) vs the 247 s
+  `Nothing to Fear` cut. Measured album-pressing lengths for the six:
+  313/367/254/281/252/247 s — every one matches the scene/archive rip
+  that previously got delivered or vetoed. `discover` passes the derived
+  album because the album, not the song's recording row, defines the
+  standard cut.
 - **Once the album pluck runs, the audio-blind LLM gate then invented
   "live" for real studio rips.** It judges only the release file name, so
   a scene rip named `Oingo Boingo - 1990 - NMR - Dark at the end of the
