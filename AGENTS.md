@@ -71,7 +71,18 @@ returns the verdict dict or None (no key, fpcalc failure, no answer):
   `matched`: (artist, title, disambiguation, conf) of the highest-scoring
              recording, across ALL clusters, whose artist+title match the
              target — a misattributed entry can rank first in the cluster
-             (Safety Dance / SIRCH, 2026-10-21)
+             (Safety Dance / SIRCH, 2026-10-21). All recordings in a
+             cluster describe the SAME fingerprinted sound, so equal
+             scores are a tie between attributions, not evidence: the
+             **non-live** attribution wins the tie (higher score still
+             wins outright). The Blink-182 "I Miss You" studio master
+             scores 0.985 against a cluster that lists "I Miss You (live
+             in Minneapolis)" FIRST and five bare studio recordings after
+             it; first-wins picked the live name and vetoed the proper-CD
+             FLAC pluck as a live take (2026-11-11) — a near-identical
+             live take is routinely linked into the studio cluster, so
+             attribution order, not score, decides studio-vs-live at the
+             top of a cluster.
   `best`:    top cluster score 0..1
   `nrecs`:   distinct catalogued (MusicBrainz-linked) recordings seen;
              `best == 0 and nrecs == 0` is zero coverage — nobody has
@@ -88,7 +99,11 @@ hit (`_delivery_get`), seed (`seed_cache`):
   live) → reject. The comment scan matters because AcoustID titles are
   often bare (Oingo Boingo studio tracks match as plain "Try") while the
   live marker sits in the comment; `\b` keeps "No One Lives Forever"
-  from a false hit.
+  from a false hit. Because identify keeps the non-live attribution on a
+  score tie, the veto fires only when NO studio-titled attribution scores
+  the same as the live one — a genuine live take keeps its veto (its own
+  cluster outranks the studio match), and where duration is gated it
+  fails the ±15 s anchor before the fingerprint even runs.
 - `matched` at any other conf → pass, logged "studio/live not proven"
   (and it does NOT set `studio_confirmed`, so the LLM's invented "live"
   veto is not overruled on a weak match).

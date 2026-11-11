@@ -1784,6 +1784,15 @@ def _acoustid_lookup(fp: str, dur: int) -> list[dict] | None:
     return None
 
 
+def _live_marked(title: str, dis: str) -> bool:
+    """True when a MusicBrainz recording's own name claims a live take.
+    The marker sits in the disambiguation comment as often as in the
+    title ('Push (live)', 'Drive (live at Edgefest 2006)'), so BOTH are
+    scanned; the word boundary avoids 'Never'/'Lives' false hits - 'No
+    One Lives Forever' is not a live take."""
+    return bool(re.search(r"\blive\b", f"{title} {dis}", re.I))
+
+
 def _acoustid_identify(path: Path, target: Target) -> dict | None:
     """Fingerprint `path` and ask AcoustID what it is. None when the check
     could not run (no key, fpcalc missing, service failure/queued) - the
@@ -1794,7 +1803,11 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
                matches the target - a misattributed copy can rank first in
                the cluster (the genuine Men Without Hats "The Safety
                Dance" was outranked by a "SIRCH - Safety Dance" entry for
-               the same audio, 2026-10-21), so every cluster is searched
+               the same audio, 2026-10-21), so every cluster is searched.
+               All recordings in a cluster describe the SAME fingerprinted
+               sound, so an equal score is a tie between attributions, not
+               evidence: the NON-live attribution wins the tie (see
+               _live_marked's tie-break in the loop below)
       best:    the top cluster score 0..1
       nrecs:   distinct MusicBrainz-LINKED recordings across all clusters;
                0 with best == 0.0 is zero coverage: nobody on AcoustID has
@@ -1816,6 +1829,7 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
     best = 0.0
     matched: tuple[str, str, str, float] | None = None
     seen: set[str] = set()
+    m_live = 0  # matched's live-mark, for the attribution tie-break
     nrecs = 0
     top = ""
     for cl in clusters:
@@ -1836,9 +1850,20 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
             if not top:
                 top = f"{artist} - {title}" if artist else title
             dis = str(rec.get("disambiguation") or "")
-            if (_acoustid_matches(artist, title, target)
-                    and (matched is None or conf > matched[3])):
-                matched = (artist, title, dis, conf)
+            if _acoustid_matches(artist, title, target):
+                # Higher score wins; on the SAME score the non-live
+                # attribution wins, because a near-identical live take is
+                # routinely linked into the studio cluster: the official
+                # Blink-182 "I Miss You" music video (studio master, 227s)
+                # scores 0.985 against a cluster that lists 'I Miss You
+                # (live in Minneapolis)' FIRST and five bare studio
+                # recordings after it, so a first-wins rule picked the live
+                # name and vetoed the proper-CD FLAC rip as "live"
+                # (2026-11-11) - the very CD rips the pipeline is for.
+                rank = (conf, 0 if _live_marked(title, dis) else 1)
+                if matched is None or rank > (matched[3], m_live):
+                    matched = (artist, title, dis, conf)
+                    m_live = rank[1]
     return {"matched": matched, "best": best, "nrecs": nrecs, "top": top}
 
 
@@ -1868,6 +1893,9 @@ def _acoustid_objection(ident: dict, target: Target,
           ('Push (live)', 'Drive (live at Edgefest 2006)'), so BOTH are
           scanned, and \\b avoids 'Never'/'Lives' false hits - 'No One
           Lives Forever' is not a live take.
+          The veto therefore fires only when NO equal-scoring studio-
+          attribution exists (identify's tie-break, above); a cluster that
+          carries both attributions delivers as the studio recording.
       zero coverage (no cluster at all) when the song IS catalogued
           -> reject: a recorded famous song always has submissions, so
           bytes nobody ever submitted are not that recording (the
@@ -1884,7 +1912,7 @@ def _acoustid_objection(ident: dict, target: Target,
     if matched:
         id_artist, id_title, id_dis, conf = matched
         if conf >= ACOUSTID_MIN_CONF:
-            if re.search(r"\blive\b", f"{id_title} {id_dis}", re.I) \
+            if _live_marked(id_title, id_dis) \
                     and not re.search(r"\blive\b", target.title, re.I):
                 return (f"fingerprint identifies a LIVE version "
                         f"({id_artist} - {id_title}, conf "
