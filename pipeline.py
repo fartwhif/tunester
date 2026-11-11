@@ -1743,6 +1743,12 @@ def verify_download(path: Path, cand: Candidate, target: Target,
     if expect and abs(info["duration"] - expect) > 15.0:
         return False, "duration", (
             f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
+    # Objective facts the LLM cannot see, recorded here for the version
+    # veto below: whether the length agrees with the studio anchor, and
+    # (set in the AcoustID block) whether the fingerprint proves a clean
+    # match to the studio recording rather than a live take.
+    anchored = bool(expect and abs(info["duration"] - expect) <= 15.0)
+    studio_confirmed = False
     ident = _acoustid_identify(path, target)
     if ident is not None:
         id_artist, id_title, conf = ident
@@ -1764,6 +1770,7 @@ def verify_download(path: Path, cand: Candidate, target: Target,
                     f"({id_artist} - {id_title}, conf {conf * 100:.0f}%)")
             log(f"        acoustid: {id_artist} - {id_title} "
                 f"(conf {conf * 100:.0f}%) - matches target")
+            studio_confirmed = True
         else:
             log(f"        acoustid: best conf {conf * 100:.0f}% < "
                 f"{ACOUSTID_MIN_CONF * 100:.0f}% - gate skipped")
@@ -1792,6 +1799,26 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         log(f"        LLM gate unavailable ({e}); proceeding filter-only")
         return True, "filter-only", ""
     version = str(d.get("version") or "unknown")
+    # A 'live' claim is the one veto an objective fingerprint can refute,
+    # and it is checked BEFORE the match flag: the QC prompt tells the
+    # model to answer "match=false AND version=live" for a live album, so
+    # a name-based live claim almost always arrives with match=false and
+    # would otherwise die on the match flag below. The AcoustID block
+    # above only sets studio_confirmed for a high-confidence fingerprint
+    # match to a NON-live recording (it rejects a live-identified one
+    # outright), so studio_confirmed + anchored is content proof of the
+    # studio cut the audio-blind LLM cannot see - it invented 'live' from
+    # the file name for MusicBrainz-Studio album rips (Oingo Boingo "Dark
+    # at the End of the Tunnel") at 96-98% fingerprint confidence. A
+    # genuine live take fails the length anchor and is never confirmed,
+    # so this overrule only rescues the fingerprint-verified studio rip.
+    if version == "live" and studio_confirmed and anchored:
+        log(f"        acoustid ({id_artist} - {id_title}, "
+            f"conf {conf * 100:.0f}%) confirms the studio recording; "
+            f"overriding LLM '{version}' veto")
+        return True, "acoustid", (
+            "fingerprint + studio-anchor length confirm the studio "
+            f"recording; LLM '{version}' veto overruled")
     if not d.get("match"):
         return False, "llm", f"{version}: {d.get('reason', 'rejected')}"
     if version in ("clean", "radio", "live", "cover", "remix"):
