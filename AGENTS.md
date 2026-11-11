@@ -26,13 +26,16 @@ entry (`_cache_write`):
   in the sidecar and drives the file name: on a hit the **stored** name is
   used (`_delivery_name`), so file name and ID3 date always agree. Hit =
   search/fetch/gates/transcode all skipped; the copy is verified by
-  `check_output` plus a ±15 s comparison against this run's `mb_duration`
-  anchor before it lands (a same-title entry that is a different cut is a
-  miss, not a substitution; `Result.gate == "cache"`). A spec failure or a
-  ruled-out cut drops the entry so the fresh delivery replaces it; a bad
-  *copy* of a sound blob is kept. Seeded from `downloads/` by
-  `app.py --seed-cache` (parses `ARTIST - TITLE (YEAR).mp3` names, runs
-  `check_output` on each, counts stored / skipped / already-in-store).
+  `check_output`, the ±15 s comparison against this run's `mb_duration`
+  anchor, AND the full AcoustID objection rules (2026-11-11, see the
+  re-verification note below) before it lands (a same-title entry that is
+  a different cut is a miss, not a substitution; `Result.gate == "cache"`).
+  A spec failure, a ruled-out cut, or a fingerprint objection drops the
+  entry so the fresh delivery replaces it; a bad *copy* of a sound blob is
+  kept. Seeded from `downloads/` by `app.py --seed-cache` (parses
+  `ARTIST - TITLE (YEAR).mp3` names, runs `check_output` and the
+  fingerprint mismatch/live check on each — a seeded library file is
+  unverified user input — counts stored / skipped / already-in-store).
   Known limit of the exact-title key: a parenthetical **subtitle** the LLM
   includes or drops run to run ("I Wanna Dance with Somebody" vs "(Who Loves
   Me)", 2026-11-10) is a separate entry and a second file. Dropping paren
@@ -43,6 +46,70 @@ stores. `_cache_evict` caps both subtrees at `TUNESTER_CACHE_MAX_MB`
 (default 30720) by entry mtime; a hit refreshes mtime so used entries
 survive. Every cache failure (unwritable dir, corrupt blob/sidecar, copy
 error) logs and returns a miss — a cache problem NEVER fails a tune.
+
+## Fingerprint re-verification (2026-11-11)
+The AcoustID gate used to run only on fresh downloads, so it had three
+blind spots found while auditing the Oingo Boingo / Blink-182 deliveries:
+(1) a `deliveries/` cache hit skipped the fingerprint entirely — an entry
+could enter the store through `--seed-cache` from a library file whose
+audio was never content-checked (the Blink-182 "I Miss You" seeded from a
+file whose actual audio was the Vevo master of a different song), and (2)
+`_acoustid_identify` treated every HTTP failure as "gate unavailable"
+without looking at the AcoustID **status** field, and AcoustID answers
+`{"status":"queued"}` (202/429: fingerprint seen, result not computed
+yet) — reading one as "no results" would condemn perfect deliveries under
+the new zero-coverage rule, so the lookup distinguishes the statuses,
+(3) a live marker sitting in the matched recording's disambiguation
+comment (bare AcoustID title) was read as a studio match.
+`_acoustid_lookup` returns the cluster list (possibly empty) only on
+`status == "ok"`; `queued` / "out of service" (under-load answers that
+used to be misread as "no results") is retried with backoff, and None —
+"the service never answered" — comes only from an error status (bad key),
+a transport failure, or retries exhausted. `_acoustid_identify` then
+returns the verdict dict or None (no key, fpcalc failure, no answer):
+
+  `matched`: (artist, title, disambiguation, conf) of the highest-scoring
+             recording, across ALL clusters, whose artist+title match the
+             target — a misattributed entry can rank first in the cluster
+             (Safety Dance / SIRCH, 2026-10-21)
+  `best`:    top cluster score 0..1
+  `nrecs`:   distinct catalogued (MusicBrainz-linked) recordings seen;
+             `best == 0 and nrecs == 0` is zero coverage — nobody has
+             these bytes on AcoustID; `best > 0 and nrecs == 0` (audio
+             seen before, no catalogued identity) is NEUTRAL
+  `top`:     "artist - title" of the first catalogued recording (the
+             reject reason's identity)
+
+`_acoustid_objection(ident, target, expect)` is the single reject rule,
+now used in ALL THREE places — fresh download (`verify_download`), cache
+hit (`_delivery_get`), seed (`seed_cache`):
+- `matched` at conf ≥ `TUNESTER_ACOUSTID_MIN_CONF` whose title OR
+  recording disambiguation comment carries `\blive\b` (target not itself
+  live) → reject. The comment scan matters because AcoustID titles are
+  often bare (Oingo Boingo studio tracks match as plain "Try") while the
+  live marker sits in the comment; `\b` keeps "No One Lives Forever"
+  from a false hit.
+- `matched` at any other conf → pass, logged "studio/live not proven"
+  (and it does NOT set `studio_confirmed`, so the LLM's invented "live"
+  veto is not overruled on a weak match).
+- no match, `best` ≥ MIN_CONF with catalogued recordings → reject
+  "identifies as <top>".
+- `best == 0 and nrecs == 0` with `expect > 0` (MusicBrainz catalogues
+  the song) and `TUNESTER_ACOUSTID_REQUIRE` on → zero-coverage reject: a
+  catalogued famous song always has submissions, so bytes nobody ever
+  submitted are not that recording — this is what condemns the Blink-182
+  "I Miss You" Vevo swap. `expect == 0` or `REQUIRE=0` keeps it a
+  warning.
+`expect` is the MusicBrainz studio anchor (`target.mb_duration`,
+year-aware from `discover`); at seed time it is 0 — no discovery ran, so
+zero coverage cannot be judged there — a seeded file with no fingerprint
+coverage is seeded and caught on its first cache hit, where the anchor
+exists. On a cache hit an objection DROPS the entry and the run re-tunes
+(self-healing: the replacement delivery is stored); no anchor + no
+coverage serves, because an AcoustID/MB failure must never condemn the
+store. `verify_download` keeps its own year-aware `expect` (consensus
+fallback when the target has no year) and the `studio_confirmed +
+anchored` overrule of an LLM "live" veto.
 
 ## Sources (priority order)
 1. **nzb.life / Usenet** (top priority). Account is **VIP membership**
@@ -141,37 +208,56 @@ gate (any non-studio version → reject).
   `TUNESTER_ACOUSTID_KEY`; fpcalc = `libchromaprint-tools`): fingerprints the
   download (chromaprint) and looks it up on AcoustID via the **v2 API**
   (`POST https://api.acoustid.org/v2/lookup`, param `client`, `meta=recordings`;
-  the legacy `acoustid.org/api/1/` endpoint is gone - 404). Confidence is the
-  the result `score` on a **0..1** scale. The best result is a cluster of
-  similar recordings: if ANY member matches the target it is a strong
-  pass, else the cluster's top recording that is NOT the target rejects
-  with gate `acoustid` when score ≥ `TUNESTER_ACOUSTID_MIN_CONF` (default
-  **0.7**), a match is a strong pass. This is the ONLY gate that catches a
-  mislabeled article — a file named/tagged "Loser" that contains a different
-  song of the right length passes every name/duration/LLM gate (see the Beck
-  "Loser" 2026-09-28 pitfall below). Silently skipped when the key or fpcalc
-  is absent. Key = the user's API key from acoustid.org (set in `.env`).
+  the result `score` on a **0..1** scale; `meta=recordings` brings each
+  recording's disambiguation comment. Every cluster is scanned: the
+  highest-scoring recording whose artist+title match the target is
+  `matched` (a misattributed entry can rank first — Safety Dance / SIRCH,
+  2026-10-21), its conf ≥ `TUNESTER_ACOUSTID_MIN_CONF` (default **0.7**)
+  is the strong pass. With no match, a top catalogued recording at
+  ≥ MIN_CONF rejects with gate `acoustid` — the ONLY gate that catches a
+  mislabeled article (a file named/tagged "Loser" that contains a
+  different song of the right length passes every name/duration/LLM gate;
+  Beck "Loser" 2026-09-28 pitfall below). Anything weaker is
+  inconclusive: logged, no verdict, the LLM gate decides. 2026-11-11: the
+  lookup is **status-aware** (a `queued` answer is retried, never read as
+  "no results"), zero coverage on a MusicBrainz-catalogued target is a
+  rejection, and the same objection rules now run on cache hits and on
+  `--seed-cache` — see the Fingerprint re-verification section. Key = the
+  user's API key from acoustid.org (set in `.env`); silently skipped when
+  the key or fpcalc is absent.
 - **LIVE-version gate (2026-11-03)**: a live take of the correct song by
   the correct artist at the correct length must NEVER be delivered - the
   deliverable is the original uncensored studio recording as it appears on
   the standard commercial CD. Two hard (non-LLM) checks:
-  (1) AcoustID - if the fingerprint identifies the content as a LIVE version
-  (`\blive\b` in the identified title, e.g. "Bohemian Rhapsody (Live at
-  Wembley)") it is rejected with gate `acoustid`, even though it would pass
-  `_acoustid_matches` (target title is a substring of the live title). A
+  (1) AcoustID - if the fingerprint identifies the content as a LIVE
+  version — `\blive\b` in the matched recording's title (e.g. "Bohemian
+  Rhapsody (Live at Wembley)") **or in its MusicBrainz disambiguation
+  comment** (`Push (live)`, `Drive (live at Edgefest 2006)`; the AcoustID
+  title is often the bare song name, the marker lives in the comment) —
+  at ≥ MIN_CONF, it is rejected with gate `acoustid`, even though the
+  match test passed (the target title is a substring of the live title).
+  Added 2026-11-11: the comment scan, and the same veto now applies on
+  cache hits and seeds, where it used to fire only on fresh downloads. A
   target that IS itself a live recording is exempt (rare). Word-boundary
-  match, so "Livin on a Prayer" is not flagged.
+  match, so "No One Lives Forever" and "Livin on a Prayer" are not
+  flagged.
   (2) LLM version vocabulary - the LLM's `match` flag is NOT trusted on its
   own: `version` in {clean, radio, live, cover, remix} rejects regardless of
   `match` (the LLM was observed answering match=true while labeling the
   version live). `VERIFY_SYSTEM` also states a live performance is never
   acceptable. Name-level live is already dropped by NEVER_WORDS ("live")
   except when it is part of the artist name (band "Live").
-- **Karaoke/instrumental blind spot** (2026-10-21): AcoustID returns
-  `None` for instrumentals (they are not in the recording DB), so a
-  clean-titled karaoke upload of the RIGHT song at the RIGHT length
-  passes every gate - no text-only gate can see that vocals are
-  missing (Men Without Hats "The Safety Dance": the nzb release was an
+- **Karaoke/instrumental blind spot** (2026-10-21): derivative audio
+  (karaoke backing tracks, instrumentals) is largely absent from the
+  AcoustID catalogue — bytes nobody submitted read as zero coverage,
+  bytes somebody did submit carry no MusicBrainz identity — so a
+  clean-titled karaoke upload can still slip the content gate: when the
+  target is MB-catalogued the zero-coverage case now REJECTS (added
+  2026-11-11, see the Fingerprint re-verification section), but coverage
+  that carries no catalogued identity stays neutral and only the LLM
+  gate stands between a troll upload and the delivery - no text-only gate
+  can see that vocals are missing (Men Without Hats "The Safety Dance":
+  the nzb release was an
   expired "Extended Club Mix" and SoundCloud's only clean-titled
   candidate was a troll's karaoke; MB anchor is 164 s = the genuine
   2:45 studio cut, which the 2:42 karaoke matched). Mitigation = source

@@ -61,12 +61,16 @@ wraps the chat endpoints, `app.py` is the CLI, `web.py` the HTTP API + UI.
    the anchor, so a concert taper cannot pass by matching itself) →
    **AcoustID content gate** (chromaprint fingerprint — the only check that
    catches a file correctly named *and* correctly long whose audio is a
-   different song) → **live-version rejection**,
-   which does not take the model's word for it: a fingerprint identifying a
-   `(Live at …)` take is refused, and so is any reply whose `version` is
-   clean/radio/live/cover/remix even when the model also answered `match=true`
-   → LLM version gate. Whatever gate rejects a candidate is logged with its
-   reason.
+   different song: a confident identification of anything else, or of no
+   submitted recording at all when MusicBrainz catalogues the target,
+   rejects; a *queued* under-load answer is retried and otherwise the
+   gate stays inconclusive rather than condemning) → **live-version
+   rejection**, which does not take the model's word for it: a fingerprint
+   identifying a `(Live at …)` take — or a live disambiguation tag on the
+   matched catalogued recording — is refused, and so is any reply whose
+   `version` is clean/radio/live/cover/remix even when the model also
+   answered `match=true` → LLM version gate. Whatever gate rejects a
+   candidate is logged with its reason.
 
 4. **transcode** — ffmpeg `-vn -c:a libmp3lame -b:a 160k -ar 44100 -ac 2`
    (video containers ship as MKV/MP4; their audio is extracted).
@@ -99,20 +103,27 @@ dir, so `downloads/` stays nothing but delivered files), keyed two ways:
   re-fetching the entire RAR set.
 - **delivery entries** — normalized artist + title, the identity the gates
   actually verified. A hit skips the search, the fetch, the gates and the
-  transcode: the song was already found and verified once, so the stored copy
-  is handed back after one output-spec re-check plus a duration comparison
-  with this run's MusicBrainz anchor (`Result.gate`, reported as
-  `gate: "cache"` by `--json`). The tag year is *not* in the key — which year
-  a pre-CD song first appeared on CD is fuzzy and discovery does not answer it
-  the same way twice — and a hit is written out under the stored entry's own
-  name (its year included), so a recording the store already served never
-  lands a second time under a second year.
+  transcode: the song was already found and verified once, so the stored
+  copy is handed back after one output-spec re-check, a duration
+  comparison with this run's MusicBrainz anchor, and one AcoustID
+  fingerprint re-check (`Result.gate`, reported as `gate: "cache"` by
+  `--json`) — so an entry seeded from a library file, or stored under an
+  older rule, is caught before it is served; an objection drops the entry
+  and the run re-tunes the song properly. The tag year is *not* in the
+  key — which year a pre-CD song first appeared on CD is fuzzy and
+  discovery does not answer it the same way twice — and a hit is written
+  out under the stored entry's own name (its year included), so a
+  recording the store already served never lands a second time under a
+  second year.
 
 `TUNESTER_CACHE_MAX_MB` (30 GB) caps both stores; the least-recently-used
 entries are evicted first and a hit counts as use. Nothing about the cache
 can fail a tune: an unwritable directory or a corrupt entry degrades to
 fetching and verifying normally. `--seed-cache` indexes an existing
-`downloads/` into the store so songs already delivered never need fetching.
+`downloads/` into the store so songs already delivered never need
+fetching; a seeded file must parse as a delivery name, pass the output
+spec, and survive the fingerprint check (a file whose audio is a
+different song or a live take is not seeded).
 
 ## CLI
 
@@ -174,7 +185,7 @@ to start — missing optional settings simply disable their feature.
 | `TUNESTER_LLM_PRIMARY_BASE_URL` / `_MODEL` / `_API_KEY` | unset | first-choice OpenAI-compatible chat endpoint; the slot is skipped when the base URL is unset |
 | `OPENAI_BASE_URL` / `OPENAI_API_KEY`, `TUNESTER_LLM_MODEL` | unset | second slot, same idea. Endpoints are tried in order per call: a refused/reset/DNS-failed one fails over immediately, a hung non-final one after `TUNESTER_LLM_FAILOVER_WAIT` (90 s) |
 | `TUNESTER_LLM_TIMEOUT` / `_LOAD_WAIT` / `_FAILOVER_WAIT` / `_THINK_BUDGET` | `240` / `360` / `90` / `100` | per-request timeout, cold-start wait allowed for the last endpoint, budget for a hung non-final one, thinking-token budget |
-| `TUNESTER_ACOUSTID_KEY` | unset | enables the AcoustID content gate (free key at acoustid.org; needs `fpcalc`, shipped in the image). `TUNESTER_ACOUSTID_MIN_CONF` (0.7) is the score at which a confident identification of a *different* recording rejects |
+| `TUNESTER_ACOUSTID_KEY` | unset | enables the AcoustID content gate (free key at acoustid.org; needs `fpcalc`, shipped in the image); the gate also re-verifies every reuse-store hit and every `--seed-cache` file. `TUNESTER_ACOUSTID_MIN_CONF` (0.7) is the score at which a confident identification of a *different* recording — or of a live take of the target — rejects. `TUNESTER_ACOUSTID_REQUIRE` (1) decides whether zero coverage rejects when MusicBrainz catalogues the target; `=0` downgrades it to a warning |
 | `TUNESTER_OUTDIR` | `./downloads` | output directory (the container uses `/data`) |
 | `TUNESTER_CACHE` | `$XDG_CACHE_HOME/tunester` | reuse store root (`$HOME/.cache/tunester` when XDG is unset); the container uses the `tunester-cache` volume at `/cache` |
 | `TUNESTER_CACHE_MAX_MB` | `30720` | cap on the reuse store; LRU entries are evicted first (a hit counts as use) |

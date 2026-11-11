@@ -63,10 +63,21 @@ DOWNLOAD_TIMEOUT = int(os.environ.get("TUNESTER_DOWNLOAD_TIMEOUT", "900"))
 # api.acoustid.org/v2/lookup); a confident identification that is NOT the
 # target song rejects the file - mislabeled articles (a "Loser" file
 # containing a different track) pass every name/duration/LLM gate, so the
-# content itself is checked. Confidence is 0..1 (v2 scale).
+# content itself is checked. Confidence is 0..1 (v2 scale). The same
+# lookup is also the reuse store's re-verification oracle: it runs on
+# every cache hit and on --seed-cache, not just on fresh downloads. A
+# MusicBrainz-catalogued song whose bytes match NO catalogued recording
+# on AcoustID is not neutral - a famous recording always carries
+# submissions, so zero coverage on a catalogued target means the file is
+# a cover, an altered take, or a mislabeled file, and REJECTS. Set
+# TUNESTER_ACOUSTID_REQUIRE=0 to downgrade that outcome back to a
+# warning (identity mismatches stay rejections either way).
 ACOUSTID_KEY = os.environ.get("TUNESTER_ACOUSTID_KEY", "")
 ACOUSTID_HOST = os.environ.get("TUNESTER_ACOUSTID_HOST", "api.acoustid.org")
 ACOUSTID_MIN_CONF = float(os.environ.get("TUNESTER_ACOUSTID_MIN_CONF", "0.7"))
+ACOUSTID_REQUIRE = os.environ.get(
+    "TUNESTER_ACOUSTID_REQUIRE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
 
 COOKIES_CANDIDATES = [
     Path("/shared-cookies/cookies.txt"),  # container shared mount (compose)
@@ -990,7 +1001,15 @@ def _delivery_get(target: Target, outdir: Path,
     is dropped). A hit writes the file the same way a fresh run would.
     The duration is also compared with this run's MusicBrainz anchor: a
     same-title entry that is a different cut (a 12" mix stored before the
-    anchor existed) is a miss, not a substitution."""
+    anchor existed) is a miss, not a substitution. The bytes are finally
+    fingerprint-checked with the SAME objection rules the download gate
+    uses - an entry can enter the store through --seed-cache from a library
+    file that was never content-checked (the Blink-182 "I Miss You" seeded
+    from a swapped Vevo master, 2026-11-11), and a rule that only gated
+    fresh downloads would serve such an entry forever. "Unavailable"
+    (no key, no fpcalc, service failure/queued) serves the hit: an outage
+    must not evict good entries. Dropping is self-healing - the re-tune
+    this run goes on to do stores the verified replacement."""
     d = _cache_dir("deliveries", log)
     if d is None:
         return None
@@ -1025,6 +1044,18 @@ def _delivery_get(target: Target, outdir: Path,
         if not problems or check_output(blob, 0.0):
             _cache_drop(d, key)
         return None
+    # The same content check, run on the copy about to be delivered. An
+    # entry may have entered the store through --seed-cache from a library
+    # file that was never fingerprint-checked, and a rule that only gated
+    # fresh downloads would serve such an entry forever.
+    ident = _acoustid_identify(part, target)
+    if ident is not None:
+        objection = _acoustid_objection(ident, target, target.mb_duration)
+        if objection:
+            log(f"        cached delivery rejected - re-tuning: {objection}")
+            part.unlink(missing_ok=True)
+            _cache_drop(d, key)
+            return None
     try:
         os.replace(part, dst)
         os.utime(blob, None)  # a hit refreshes the entry: LRU keeps what is used
@@ -1062,6 +1093,11 @@ def seed_cache(outdir: Path, log=print) -> tuple[int, int, int]:
     never need fetching again. Only names that parse as the delivery name
     ("ARTIST - TITLE (YEAR).mp3") and files that still pass the output check
     are stored, so foreign MP3s in the output dir never enter the cache.
+    The fingerprint gate runs here too (a library file is unverified user
+    input): one that identifies as a different song or as a live take is
+    not seeded. Zero coverage cannot be judged at seed time - no discovery
+    ran, so there is no MusicBrainz anchor - those files are seeded and
+    re-checked on the first cache hit, where the anchor exists.
     Files whose song is already in the store are counted separately, so a
     second run says plainly that nothing new went in.
     Returns (stored, skipped, already-stored)."""
@@ -1088,6 +1124,13 @@ def seed_cache(outdir: Path, log=print) -> tuple[int, int, int]:
             skipped += 1
             log(f"  skip {f.name}: " + "; ".join(problems))
             continue
+        ident = _acoustid_identify(f, target)
+        if ident is not None:
+            objection = _acoustid_objection(ident, target, 0.0)
+            if objection:
+                skipped += 1
+                log(f"  skip {f.name}: {objection}")
+                continue
         if _delivery_put(f, target, "", "", log):
             stored += 1
         else:
@@ -1680,17 +1723,11 @@ def _consensus_duration(artist: str, title: str) -> float | None:
     return best[len(best) // 2]
 
 
-def _acoustid_identify(path: Path, target: Target) -> tuple[str, str, float] | None:
-    """Fingerprint `path` (chromaprint) and look it up on AcoustID (v2).
-    Returns (artist, title, confidence 0..1) for the best match, or None
-    when no key is set, fpcalc is missing, or the service fails.
-
-    The best result is a cluster of acoustically similar recordings. If
-    ANY member matches the target, the target match is returned: a
-    misattributed copy can rank first in the cluster (the genuine
-    Men Without Hats "The Safety Dance" was outranked by a "SIRCH -
-    Safety Dance" entry for the same audio, 2026-10-21)."""
-    if not ACOUSTID_KEY or not shutil.which("fpcalc"):
+def _fingerprint(path: Path) -> tuple[str, int] | None:
+    """chromaprint (fpcalc) fingerprint + its duration, or None when fpcalc
+    is missing, fails, or prints no usable pair. A real MP3 always yields a
+    fingerprint, so None here is a TOOL failure, never a content verdict."""
+    if not shutil.which("fpcalc"):
         return None
     try:
         proc = subprocess.run(["fpcalc", str(path)],
@@ -1708,40 +1745,101 @@ def _acoustid_identify(path: Path, target: Target) -> tuple[str, str, float] | N
             return None
     except (OSError, ValueError):
         return None
+    return fp, dur
+
+
+def _acoustid_lookup(fp: str, dur: int) -> list[dict] | None:
+    """AcoustID v2 result clusters for one fingerprint: the cluster list
+    (possibly empty) on a real answer, or None when the SERVICE did not
+    answer - bad key, timeout, malformed reply, or a 'queued' / rate-limited
+    status that never clears in the retries. That distinction is the whole
+    point: an empty list means "nobody has ever submitted these bytes"
+    (content evidence against the file); None means "we do not know", and
+    a flaky service must never condemn - or rescue - a file."""
     body = urllib.parse.urlencode({
         "client": ACOUSTID_KEY, "fingerprint": fp, "duration": str(dur),
         "meta": "recordings", "format": "json"})
-    try:
-        req = urllib.request.Request(
-            f"https://{ACOUSTID_HOST}/v2/lookup",
-            data=body.encode("utf-8"),
-            headers={"User-Agent": BROWSER_UA,
-                     "Content-Type": "application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            d = json.load(r)
-    except Exception:
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(
+                f"https://{ACOUSTID_HOST}/v2/lookup",
+                data=body.encode("utf-8"),
+                headers={"User-Agent": BROWSER_UA,
+                         "Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+        except Exception:
+            time.sleep(2.0 * (attempt + 1))
+            continue
+        status = d.get("status")
+        if status == "ok":
+            return d.get("results") or []
+        if status in ("queued", "out of service", None):
+            # 'queued' is AcoustID's under-load answer; the audit run saw
+            # it repeatedly and every blind reading of it as "no results"
+            # would drop a perfectly good cached delivery.
+            time.sleep(3.0 * (attempt + 1))
+            continue
+        return None  # error status (bad key etc.): treat as service failure
+    return None
+
+
+def _acoustid_identify(path: Path, target: Target) -> dict | None:
+    """Fingerprint `path` and ask AcoustID what it is. None when the check
+    could not run (no key, fpcalc missing, service failure/queued) - the
+    gate is SKIPPED then, never a verdict. Otherwise a verdict dict:
+
+      matched: (artist, title, disambiguation, conf) of the highest-scoring
+               cluster containing ANY MusicBrainz-linked recording that
+               matches the target - a misattributed copy can rank first in
+               the cluster (the genuine Men Without Hats "The Safety
+               Dance" was outranked by a "SIRCH - Safety Dance" entry for
+               the same audio, 2026-10-21), so every cluster is searched
+      best:    the top cluster score 0..1
+      nrecs:   distinct MusicBrainz-LINKED recordings across all clusters;
+               0 with best == 0.0 is zero coverage: nobody on AcoustID has
+               these bytes. A well-known recording ALWAYS carries
+               submissions, so for a catalogued target that is content
+               evidence the file is not the recording its name claims;
+               best > 0 with nrecs == 0 means the audio was seen before but
+               carries no MusicBrainz identity - neutral, not evidence
+      top:     'artist - title' of the first linked recording (what the
+               file identifies as, for the reject reason)"""
+    if not ACOUSTID_KEY:
         return None
-    results = d.get("results") or []
-    if not results:
+    got = _fingerprint(path)
+    if got is None:
         return None
-    top = results[0]
-    conf = float(top.get("score") or 0.0)
-    recs = top.get("recordings") or []
-    if not recs:
+    clusters = _acoustid_lookup(*got)
+    if clusters is None:
         return None
-    for rec in recs:
-        artists = rec.get("artists") or []
-        artist = str(artists[0].get("name") or "") if artists else ""
-        title = str(rec.get("title") or "")
-        if title and _acoustid_matches(artist, title, target):
-            return artist, title, conf
-    rec = recs[0]
-    artists = rec.get("artists") or []
-    artist = str(artists[0].get("name") or "") if artists else ""
-    title = str(rec.get("title") or "")
-    if not title:
-        return None
-    return artist, title, conf
+    best = 0.0
+    matched: tuple[str, str, str, float] | None = None
+    seen: set[str] = set()
+    nrecs = 0
+    top = ""
+    for cl in clusters:
+        conf = float(cl.get("score") or 0.0)
+        best = max(best, conf)
+        for rec in cl.get("recordings") or []:
+            rid = str(rec.get("id") or "")
+            if rid and rid in seen:
+                continue
+            if rid:
+                seen.add(rid)
+            artists = rec.get("artists") or []
+            artist = str(artists[0].get("name") or "") if artists else ""
+            title = str(rec.get("title") or "")
+            if not title:
+                continue
+            nrecs += 1
+            if not top:
+                top = f"{artist} - {title}" if artist else title
+            dis = str(rec.get("disambiguation") or "")
+            if (_acoustid_matches(artist, title, target)
+                    and (matched is None or conf > matched[3])):
+                matched = (artist, title, dis, conf)
+    return {"matched": matched, "best": best, "nrecs": nrecs, "top": top}
 
 
 def _acoustid_matches(artist: str, title: str, target: Target) -> bool:
@@ -1751,6 +1849,55 @@ def _acoustid_matches(artist: str, title: str, target: Target) -> bool:
                  or _norm(artist) in _norm(target.artist))
     return artist_ok and (title_present(title, target.title)
                           or title_present(target.title, title))
+
+
+def _acoustid_objection(ident: dict, target: Target,
+                        expect: float) -> str:
+    """Why this fingerprint verdict disqualifies the file, or '' to let it
+    through (`expect`: the MusicBrainz studio-length anchor - >0 means
+    MusicBrainz CATALOGUES this recording, which is what makes zero
+    coverage meaningful).
+
+      confident identification that is not the target  -> reject (a
+          mislabeled file passes every name gate; the content is the only
+          way to catch it)
+      confident identification of a LIVE take of the target -> reject: the
+          deliverable is the studio CD recording (a target that is itself
+          a live recording - rare - is exempt). The live marker often sits
+          in the recording's disambiguation comment instead of the title
+          ('Push (live)', 'Drive (live at Edgefest 2006)'), so BOTH are
+          scanned, and \\b avoids 'Never'/'Lives' false hits - 'No One
+          Lives Forever' is not a live take.
+      zero coverage (no cluster at all) when the song IS catalogued
+          -> reject: a recorded famous song always has submissions, so
+          bytes nobody ever submitted are not that recording (the
+          Blink-182 "I Miss You" Vevo master that had been swapped for
+          someone else's performance, 2026-11-11, fingerprinted to
+          nothing while the real recording identifies at 0.97+). An
+          uncatalogued song can legitimately have zero submissions -
+          there it stays a warning.
+    TUNESTER_ACOUSTID_REQUIRE=0 downgrades the last one to a warning; the
+    identity mismatches stay rejections (they are positive evidence, not
+    absence of evidence)."""
+    best, nrecs = ident["best"], ident["nrecs"]
+    matched = ident["matched"]
+    if matched:
+        id_artist, id_title, id_dis, conf = matched
+        if conf >= ACOUSTID_MIN_CONF:
+            if re.search(r"\blive\b", f"{id_title} {id_dis}", re.I) \
+                    and not re.search(r"\blive\b", target.title, re.I):
+                return (f"fingerprint identifies a LIVE version "
+                        f"({id_artist} - {id_title}, conf "
+                        f"{conf * 100:.0f}%)")
+        return ""
+    if best >= ACOUSTID_MIN_CONF and nrecs:
+        return (f"fingerprint identifies as {ident['top']} (conf "
+                f"{best * 100:.0f}%)")
+    if best == 0.0 and not nrecs and expect and ACOUSTID_REQUIRE:
+        return ("no AcoustID coverage: these bytes match no submitted "
+                f"recording, but {target.artist} - {target.title} is "
+                f"catalogued (~{expect:.0f}s on MusicBrainz)")
+    return ""
 
 
 def verify_download(path: Path, cand: Candidate, target: Target,
@@ -1794,30 +1941,34 @@ def verify_download(path: Path, cand: Candidate, target: Target,
     anchored = bool(expect and abs(info["duration"] - expect) <= 15.0)
     studio_confirmed = False
     ident = _acoustid_identify(path, target)
-    if ident is not None:
-        id_artist, id_title, conf = ident
-        if conf >= ACOUSTID_MIN_CONF:
-            if not _acoustid_matches(id_artist, id_title, target):
-                return False, "acoustid", (
-                    f"fingerprint identifies as {id_artist} - {id_title} "
-                    f"(conf {conf * 100:.0f}%)")
-            # A fingerprint that identifies the content as a LIVE version
-            # of the target still passes _acoustid_matches (the target
-            # title is a substring of the live title) - reject it: the
-            # deliverable is the studio CD recording, and a live take of
-            # the same song is not. A target that is itself a live
-            # recording (rare) is exempt.
-            if re.search(r"\blive\b", id_title, re.I) and not re.search(
-                    r"\blive\b", target.title, re.I):
-                return False, "acoustid", (
-                    f"fingerprint identifies a LIVE version "
-                    f"({id_artist} - {id_title}, conf {conf * 100:.0f}%)")
+    if ident is None:
+        log("        acoustid: unavailable - gate skipped")
+    else:
+        objection = _acoustid_objection(ident, target, expect)
+        if objection:
+            return False, "acoustid", objection
+        matched = ident["matched"]
+        if matched and matched[3] >= ACOUSTID_MIN_CONF:
+            id_artist, id_title, id_dis, conf = matched
             log(f"        acoustid: {id_artist} - {id_title} "
                 f"(conf {conf * 100:.0f}%) - matches target")
             studio_confirmed = True
+        elif matched:
+            log(f"        acoustid: {matched[0]} - {matched[1]} at conf "
+                f"{matched[3] * 100:.0f}% < "
+                f"{ACOUSTID_MIN_CONF * 100:.0f}% - studio/live not proven")
+        elif ident["best"] == 0.0 and not ident["nrecs"]:
+            log("        acoustid: zero coverage, no MusicBrainz anchor "
+                "(uncatalogued song) - gate skipped")
         else:
-            log(f"        acoustid: best conf {conf * 100:.0f}% < "
-                f"{ACOUSTID_MIN_CONF * 100:.0f}% - gate skipped")
+            # Audio someone fingerprinted before, but with no
+            # MusicBrainz-linked identity (or only a weak one): could be
+            # the target recording submitted unlinked, could be something
+            # else. Not evidence either way; the name gates and the LLM
+            # decide.
+            log(f"        acoustid: best conf {ident['best'] * 100:.0f}%, "
+                "no matching linked recording - gate skipped")
+
 
     if not (use_llm and llm):
         return True, "filter-only", ""
