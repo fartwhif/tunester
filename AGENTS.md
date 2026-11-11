@@ -399,6 +399,29 @@ that `02-dead-mans-party`/`dmp-remastered` carry.
   off 429/5xx up to 4 times so the album backfill survives load; it was
   NOT the cause of the empty album (that was the slot bug above) — the
   429 explanation was a false lead this session's probes disproved.
+- **Once the album pluck runs, the audio-blind LLM gate then invented
+  "live" for real studio rips.** It judges only the release file name, so
+  a scene rip named `Oingo Boingo - 1990 - NMR - Dark at the end of the
+  tunnel` (or `.../02 - Skin.flac` inside it) read to the model as a live
+  album — but MusicBrainz types *Dark at the End of the Tunnel* (1990) as
+  a STUDIO album (it is exactly what `musicbrainz_studio_year` derives for
+  Skin / When the Lights Go Out). Both were rejected as "live" despite
+  AcoustID matching `Oingo Boingo - Skin` 98% and `When the Lights Go
+  Out` 96% with NO live marker, and lengths inside the 283 / 251 s studio
+  anchors. Fix: a `version=live` veto is the one the QC gate can override
+  with evidence. AcoustID already *rejects* a fingerprint that identifies
+  a live recording, so a high-confidence match to a NON-live recording
+  (`studio_confirmed`) PLUS a length matching the anchor (`anchored`) is
+  content proof the name-reading model lacks; `verify_download` delivers
+  the rip (`gate="acoustid"`). It fires only on that conjunction — a real
+  taper fails the length anchor and stays rejected — and is checked
+  BEFORE the `match` flag, because the QC prompt tells the model to answer
+  `match=false AND version=live` for a live album, so the name-based claim
+  arrives with `match=false` and a veto placed after the match check never
+  ran (a real bug this session caught in the first re-run). Does NOT
+  override `clean/radio/cover/remix` vetoes or a `version=unknown` reject
+  (Weird Science's `snacks version`): only the live claim is fingerprint-
+  refutable. `unknown` still refuses — when unsure, match=false stands.
 
 ## Video fallback (nzb)
 Audio files always beat video files within a release; video containers
