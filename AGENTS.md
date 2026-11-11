@@ -299,6 +299,107 @@ Early-return on the first verified release caps quota spend.
   `LLM(log=...)` inside `chat()` — single choke point; both the discover
   and gate prompts pass through it.
 
+## Concert vs CD-rip sourcing (Oingo Boingo, 2026-11-10)
+"many of the Oingo Boingo tracks ended up tuning to live tracks". Four
+delivered files proved four distinct leaks, each needing its own fix:
+- `Just Another Day` 361.9 s from `ob1995-10-20.ecm-939` (concert taper),
+  `When the Lights Go Out` from `ob1990-10-27.sbd` (soundboard), `Wild Sex`
+  from `ob1986-12-31.ecm-939`, `Skin` 268.9 s from `ob1993-01-08.aud`
+  (Warfield taper) — all from dated `*.aud/.sbd/.ecm` archive items.
+- A taper's per-file names carry the song title exactly like a rip
+  (`339 Just Another Day.flac`), so per-file filters cannot separate a
+  concert upload from an album rip and tapers outrank studio items.
+  `_archive_is_live_item` (sources.py) now drops the WHOLE item before any
+  file is considered, keyed on identifier + title + creator ONLY — never the
+  description (every reissue mentions a concert) and never the separate
+  `date` FIELD (a commercial album carries `1985-10-28` there; Dead Man's
+  Party does). A taper instead encodes its show date in the identifier/title
+  (`ob1993-01-08`, `Live at the Aquarius`, venue+date) or a radio/DJ creator
+  (`PoP dEFECT RADIO`); "live" is exempt when the artist is literally named
+  Live, mirroring `make_bad_filter`. Verified 0/15 mismatches on the live
+  Boingo items + a "Live"-band control. The item title is also passed to
+  the gate as `source_collection` so a same-length taper the classifier
+  misses (Skin is within the 15 s anchor tolerance of its 283 s target) is
+  still refused.
+- The duration anchor ran only for candidates WITHOUT a self-reported
+  length (`if not cand.duration`), i.e. nzb IDs alone; an archive file
+  carries its own `tracklen`, so a 362 s taper compared 362 against its own
+  362 and never against the 314 s studio anchor. The anchor is now
+  unconditional; `cand.duration` survives only for the truncation check.
+- The typed year was discarded: `_requested_title` strips `(1985)` and
+  nothing pinned it, so the LLM's nondeterministic year (returned 1982 for
+  Just Another Day) drove the ±1 album window and the anchor. `_requested_-
+  year` re-reads the trailing `(YYYY)` (present ONLY in the explicit
+  `Artist - Title (YYYY)` form, so a free-form "...from 1986" is untouched)
+  and keeps it as ground truth. With 1985 the anchor populates (314 / 229 /
+  283 s measured) and the studio album derives.
+- **Apostrophes defeat the album query on BOTH sources.** MB returns the
+  curly `Dead Man’s Party`; nzb.life ANDs on the apostrophe, so
+  `Dead Man's Party` returned only 3 loosely-matched NMR/bootleg docs and
+  MISSED `Oingo Boingo-Dead Mans Party-WEB-1985-MARR` (the scene studio rip,
+  5 WEB hits once stripped); archive returned 25 podcast/taper noise docs
+  and missed the studio items `dmp-remastered-expanded-edition`,
+  `oingo-boingo-dead-mans-party_202609`, `02-dead-mans-party` (which hold
+  `01 Just Another Day.flac`, `09 Weird Science.flac`, …). `_query_text`
+  strips straight + curly apostrophes from the OUTGOING nzb and archive
+  query strings only; the stored album keeps it (compared only via `_norm`).
+  Apostrophe-free albums (`Nothing to Fear`, `Only a Lad`) were always fine
+  — which is why non-`Dead Man's Party` Boingo songs already delivered right.
+`Weird Science` (138.4 s) is a separate wrong-version: the studio SINGLE/radio
+edit (~2:18), which the duration anchor now vetoes against the 229 s album cut
+that `02-dead-mans-party`/`dmp-remastered` carry.
+
+- **The typed-year pin does NOT cover the real GrabbyTube flow, which
+  sends NO year.** `GrabbyTube/tunester.py:104` submits exactly
+  `"author - title"` with no `(YYYY)`, so `_requested_year` is empty for
+  EVERY track and the only year left driving the ±1 album window and the
+  duration anchor is the nondeterministic LLM guess (1979/1982/1985/1986
+  across runs for the same six titles). A wrong year empties
+  `musicbrainz_album`'s window so the studio rip — reachable ONLY through
+  the album query — is never found and a concert take wins. Fix: when NO
+  year is typed, override the LLM year with `musicbrainz_studio_year`,
+  MB's date of the FIRST studio album the song appeared on (earliest
+  exact-title recording carrying a NON-live album release; live groups
+  like "Boingo Alive" / "13 January 1993, Universal Amphitheatre" /
+  "Farewell: Live…" are skipped, and the original album always predates
+  its own compilations, so earliest == original). Objective, not the
+  LLM's coin-flip. Measured: JAD/Weird Science/NOLF -> 1985 (Dead Man's
+  Party), Skin/When the Lights Go Out -> 1990 (Dark at the End of the
+  Tunnel), Wild Sex -> 1982 (Nothing to Fear); anchors then populate at
+  the true studio lengths 314/229/254/283/257/251 s. The override fires
+  ONLY with no typed year (a free-form "...from 1986" still defers to the
+  LLM, and an explicit `(YYYY)` still pins, as above).
+- **The ACTUAL reason the album was always empty was a silent
+  positional-argument regression, NOT the year and NOT rate limits.**
+  `Target`'s fields went `artist, title, year, album` -> `discover` line
+  `target = Target(artist, title, year, album)` was a correct 4-positional
+  call. On 2026-10-22 commit `6f43645` ("Tag delivered files with
+  cd_year") inserted `cd_year` as the 4th field, pushing `album` to 5th,
+  but left that call unchanged. So `album` was bound into the `cd_year`
+  slot and `target.album` stayed `""`; the very next line
+  (`target.cd_year = cd_year`) then overwrote the misplaced album. Net:
+  `target.album == ""` for EVERY `discover()` since 2026-10-22, so the
+  album pluck — the ONLY route to a studio rip (a studio track does not
+  appear in any title-matched archive item: JAD's title-only
+  `_archive_search` returns 0, the album query returns
+  `01 - Just Another Day.flac`) — silently never ran for ANY song, and
+  everything fell back to title-search concert tapers. Fix: pass album BY
+  NAME, `Target(artist, title, year, album=album)`. Caught because
+  `musicbrainz_album(...)` returned `'Dead Man's Party'` on 5/5 calls
+  while `target.album` was `''` — the return value was correct but
+  discarded; the contradiction pointed straight at the assignment slot.
+  With the slot fixed, JAD delivers the scene studio rip
+  `Oingo Boingo-Dead Mans Party-1985-EOS` (nzb album-pluck -> llm gate ->
+  313.1 s, within the 314 s anchor).
+- **`_mb_get` is rate-throttled (1.2 s spacing + 4× backoff)** as
+  hardening, not the live-rip fix: a single tune now makes 5 MB calls
+  (studio_year + album + cd_year + duration + the release-exists check),
+  and MB's budget is ~1 req/s per IP with the host and the container
+  sharing the box's single egress IP. The throttle spaces them and backs
+  off 429/5xx up to 4 times so the album backfill survives load; it was
+  NOT the cause of the empty album (that was the slot bug above) — the
+  429 explanation was a false lead this session's probes disproved.
+
 ## Video fallback (nzb)
 Audio files always beat video files within a release; video containers
 (mkv/mp4/…) are fetched and transcoded audio-only (`-vn`), then QC'd.

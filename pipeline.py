@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -159,6 +160,9 @@ A music-video release is judged by its audio track (normally the studio recordin
 scene tags (DDC, 1080p, x264, group names) describe the video, not the audio.
 A multi-track release (12" single, sampler, compilation) is judged by the
 specific source_file named below; if that file is a different track, match=false.
+A source_collection names the album / upload the specific file was taken from: a dated
+venue recording ("... 1993-01-08 ... The Warfield ...", a "*.aud" taper) or a "Live at ..."
+upload is a concert even if the named file is the right song at the right length - match=false.
 
 Reply with ONLY a JSON object, no other text:
 {"match":true,"version":"studio|explicit|clean|radio|live|cover|remix|unknown","reason":"one short sentence"}
@@ -211,6 +215,15 @@ def _requested_title(raw: str) -> str:
     return title.strip()
 
 
+def _requested_year(raw: str) -> str:
+    """The release year the user typed in 'Artist - Title (YYYY)', or ''.
+    The trailing '(YYYY)' is the year, not part of the title (the same
+    token _requested_title strips); a year in a free-form description
+    has no such trailing group, so the LLM's year still applies there."""
+    m = re.search(r"\((1[9]\d{2}|20\d{2})\)\s*$", raw.strip())
+    return m.group(1) if m else ""
+
+
 def _title_matches(a: str, b: str) -> bool:
     """Fuzzy title identity: misspellings and casing variants are the same
     song ('Feel Goud Inc' ~ 'Feel Good Inc.'); a different song never is
@@ -240,6 +253,9 @@ def _artist_matches(a: str, b: str) -> bool:
 
 def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     raw = raw.strip()
+    # Computed from the original raw before the heuristic branch below
+    # strips a typed "(YYYY)" out of raw.
+    req_year = _requested_year(raw)
     cd_year = ""
     if use_llm:
         d = llm.chat_json(DISCOVER_SYSTEM, raw)
@@ -273,6 +289,18 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
             log(f"      LLM substituted title '{title}'; pinning requested "
                 f"title '{req_title}'")
             title, year, cd_year, album = req_title, "", "", ""
+        # The typed release year is ground truth for the song the user
+        # named. The LLM's year is nondeterministic - the same pinned
+        # "Oingo Boingo - Just Another Day (1985)" query returned 1982 -
+        # and a wrong year both zeroes the duration anchor (musicbrainz_-
+        # duration needs a year-dated cluster) and empties the album-
+        # derivation +/-1-year window, so the studio album-pluck and the
+        # studio-length veto silently skip and only concert tapers remain.
+        # The trailing "(YYYY)" is only ever present in the explicit
+        # 'Artist - Title (YYYY)' form, so honoring it cannot touch a
+        # free-form description (where the LLM's year still applies).
+        if req_year:
+            year = req_year
     else:
         # heuristic fallback: "Artist - Title (YYYY)"
         year = ""
@@ -285,6 +313,21 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
             raise TuneError("cannot parse 'Artist - Title' without the LLM; "
                             "rerun without --no-llm")
         artist, title, album = m.group(1).strip(), m.group(2).strip(), ""
+    # Without a typed year the only year driving musicbrainz_album's
+    # +/-1 window and musicbrainz_duration's cluster is the discover LLM's
+    # guess - nondeterministic (the same pinned "Oingo Boingo - Just
+    # Another Day" returned 1982 AND 1990) and wrong often enough to
+    # empty the album window so the studio rip (reachable ONLY through the
+    # album query) is never found and a concert take wins instead. MB's
+    # first-studio-album date is objective, so when the user typed no
+    # year (GrabbyTube sends plain "Artist - Title"), trust it.
+    if not req_year:
+        mb_year = musicbrainz_studio_year(artist, title, log)
+        if mb_year:
+            if year and str(mb_year) != year:
+                log(f"      search year {year} (LLM guess) -> {mb_year} "
+                    f"(first studio album, MusicBrainz)")
+            year = str(mb_year)
     if not album or _mb_release_exists(artist, album, log) is False:
         # An LLM album MusicBrainz refutes is often a label name or a
         # wrong guess (qwen said "Ruckus" for Men Without Hats); the
@@ -300,7 +343,11 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
         cd_year = ""
     if not cd_year:
         cd_year = musicbrainz_cd_year(artist, title, log)
-    target = Target(artist, title, year, album)
+    # cd_year sits between year and album, so pass album BY NAME: a bare
+    # positional 4th arg would land in cd_year (added 2026-10-22) and drop
+    # the derived album - which is what made the studio-album pluck silently
+    # stop running and every song fall back to concert tapers.
+    target = Target(artist, title, year, album=album)
     target.cd_year = cd_year
     target.mb_duration = musicbrainz_duration(artist, title, year, log)
     if target.mb_duration:
@@ -317,13 +364,24 @@ def _clean_year(s: str) -> str:
 
 MB_BASE = "https://musicbrainz.org/ws/2"
 MB_UA = "tunester/1.0 (music QC pipeline)"
-
+MB_MIN_INTERVAL = 1.2          # MB's documented ~1 req/s budget per IP
+_MB_LOCK = threading.Lock()
+_MB_LAST = [0.0]               # wall time of the previous MB request
 
 def _mb_get(path: str, log) -> dict | None:
     """One MusicBrainz Web Service call (JSON); None on any failure.
-    One retry after a pause on 429/5xx - the API allows ~1 req/s per IP."""
+    Spaced >= MB_MIN_INTERVAL apart (discover chains an album + cd_year +
+    duration lookup per tune and more across sources; firing them
+    back-to-back self-inflicts a 429 that empties the album backfill and
+    silently reverts to title-only search) and retried with backoff, so
+    the studio-album anchor survives."""
     url = f"{MB_BASE}{path}"
-    for attempt in range(2):
+    for attempt in range(4):
+        with _MB_LOCK:
+            wait = MB_MIN_INTERVAL - (time.time() - _MB_LAST[0])
+            if wait > 0:
+                time.sleep(wait)
+            _MB_LAST[0] = time.time()
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": MB_UA,
@@ -331,8 +389,8 @@ def _mb_get(path: str, log) -> dict | None:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return json.loads(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and attempt == 0:
-                time.sleep(3)
+            if e.code in (429, 500, 502, 503, 504) and attempt + 1 < 4:
+                time.sleep(1.5 * (attempt + 1))
                 continue
             log(f"      musicbrainz: HTTP {e.code}")
             return None
@@ -356,6 +414,65 @@ def _cluster_median(durs: list[float]) -> float:
         return 0.0
     best = sorted(best)
     return float(best[len(best) // 2])
+
+def musicbrainz_studio_year(artist: str, title: str,
+                            log=print) -> int:
+    """Year of the ORIGINAL studio album the song first appeared on, from
+    MusicBrainz; 0 when it cannot be established.
+
+    Among exact-title recordings (artist match enforced), a recording
+    counts when it carries at least one NON-LIVE album release whose title
+    differs from the song (a live album or a dated concert bootleg —
+    "Boingo Alive", "13 January 1993, Universal Amphitheatre", "Farewell:
+    Live from the Universal Amphitheater" — is not a studio album, and a
+    release titled exactly like the song is the single, not the album).
+    The earliest such recording's release date is the studio album year.
+    The original album always predates its own compilations and live
+    reissues, so earliest is the original, not a greatest-hits.
+
+    This is ground truth for the search year when the user did not type
+    one: MusicBrainz's date is exact, whereas the discover LLM's year is
+    nondeterministic (the same pinned "Just Another Day" returned 1982 and
+    1990) and a wrong year empties musicbrainz_album's +/-1 window AND
+    mis-dates musicbrainz_duration's cluster, so the studio rip becomes
+    unfindable and only concert takes remain — exactly the Oingo Boingo
+    failure this fixes."""
+    q = urllib.parse.urlencode({
+        "query": f'recording:"{title}" AND artist:"{artist}"',
+        "fmt": "json", "limit": 100, "inc": "release-groups"})
+    data = _mb_get(f"/recording?{q}", log)
+    if not data:
+        return 0
+    a, t = _norm(artist), _norm(title)
+    best = 0
+    for r in data.get("recordings", []):
+        if _norm(str(r.get("title") or "")) != t:
+            continue
+        ac = _norm(" ".join(x.get("name", "")
+                            for x in r.get("artist-credit", [])))
+        if not (a in ac or ac in a):
+            continue
+        fd = str(r.get("first-release-date") or "")
+        if not re.match(r"\d{4}", fd):
+            continue
+        year = int(fd[:4])
+        if best and year >= best:
+            continue  # only an earlier candidate can win
+        has_studio_album = False
+        for rel in r.get("releases", []):
+            if _norm(str(rel.get("title") or "")) == t:
+                continue  # the single, not the album
+            rg = rel.get("release-group") or {}
+            if str(rg.get("primary-type") or "").lower() == "live" or any(
+                    str(s).lower() == "live"
+                    for s in (rg.get("secondary-types") or [])):
+                continue  # live album/bootleg
+            has_studio_album = True
+            break
+        if has_studio_album:
+            best = year
+    return best
+
 
 
 def musicbrainz_duration(artist: str, title: str, year: str,
@@ -439,7 +556,16 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
     the VLS "Loser") and are excluded. With a known year, titles with a
     pressing dated within +/-1 of it are preferred (the album's own era -
     otherwise a later greatest-hits can out-press the original); the
-    most-pressed title wins, ties by earliest date."""
+    most-pressed title wins, ties by earliest date.
+
+    A live-typed release-group - a live album or dated concert bootleg
+    (MB marks even an "Album" primary-type with the "Live" secondary
+    type) - is never the studio album a song "first appeared on", so it is
+    dropped from the tally: Oingo Boingo's 30-pressing "13 January 1993,
+    Universal Amphitheatre, Los Angeles" bootleg otherwise ties/outscores
+    the real studio album (Bone / Nothing to Fear / Dark at the End of the
+    Tunnel) inside a +/-1-year window around a mistyped 1994 and becomes
+    the searched "album", so only concert rips are found."""
     q = urllib.parse.urlencode({
         "query": f'recording:"{title}" AND artist:"{artist}"',
         "fmt": "json", "limit": 100})
@@ -461,6 +587,11 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
             rt = str(rel.get("title") or "").strip()
             if not rt:
                 continue
+            rg = rel.get("release-group") or {}
+            if str(rg.get("primary-type") or "").lower() == "live" or any(
+                    str(s).lower() == "live"
+                    for s in (rg.get("secondary-types") or [])):
+                continue  # a live album/bootleg is not the studio album
             n = _norm(rt)
             if n == t:
                 continue
@@ -1592,20 +1723,26 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         return False, "probe", (
             f"truncated: {info['duration']:.0f}s of {cand.duration:.0f}s "
             "(preview or partial upload)")
-    if not cand.duration:
-        # Duration anchor: with a known year, only the MusicBrainz
-        # year-dated studio length is trusted (a remix-era length must
-        # not veto the studio cut); without one, MB then consensus.
-        if target.year:
-            expect = target.mb_duration
-            why = "MusicBrainz"
-        else:
-            expect = target.mb_duration or _consensus_duration(
-                target.artist, target.title)
-            why = "MusicBrainz/other sources"
-        if expect and abs(info["duration"] - expect) > 15.0:
-            return False, "duration", (
-                f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
+    # Duration anchor: the length the target STUDIO recording is expected
+    # to have, applied to EVERY candidate - not only self-report-free
+    # ones. An archive.org concert taper carries its OWN tracklen, so
+    # gating this on `not cand.duration` let a 362s ob1995 taper clear a
+    # 314s studio target: it compared 362s against the taper's own 362s
+    # and never against the studio length. cand.duration's only job is
+    # the truncation check just above. With a known year only the
+    # year-dated MusicBrainz length is trusted (a remix-era length must
+    # not veto the studio cut), so a 0 mb_duration means "no anchor",
+    # not a veto.
+    if target.year:
+        expect = target.mb_duration
+        why = "MusicBrainz"
+    else:
+        expect = target.mb_duration or _consensus_duration(
+            target.artist, target.title)
+        why = "MusicBrainz/other sources"
+    if expect and abs(info["duration"] - expect) > 15.0:
+        return False, "duration", (
+            f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
     ident = _acoustid_identify(path, target)
     if ident is not None:
         id_artist, id_title, conf = ident
@@ -1634,6 +1771,11 @@ def verify_download(path: Path, cand: Candidate, target: Target,
     if not (use_llm and llm):
         return True, "filter-only", ""
     extra = f'\nsource_file="{file_name}"' if file_name else ""
+    # The archive item title (the collection the file was plucked from)
+    # disambiguates a studio album rip from a same-song, same-length
+    # concert taper whose per-file name is just "Skin".
+    if cand.release and _norm(cand.release) != _norm(cand.title):
+        extra += f'\nsource_collection="{cand.release}"'
     if path.suffix.lstrip(".").lower() in NZB_VIDEO_EXTS:
         extra += "\nsource=video release (only the audio track is judged)"
     user = (

@@ -110,6 +110,9 @@ class Candidate:
     popularity: int = 0
     score: int = 0
     posted: float = 0.0  # release post timestamp (nzb.pubDate); 0 = unknown
+    release: str = ""    # archive.org item title (the collection this file
+                         # was plucked from); the gate uses it to tell a
+                         # studio album from a concert taper of the same track
 
 
 def _words(text: str) -> list[str]:
@@ -249,6 +252,57 @@ def _parse_length(value) -> float | None:
         return None
 
 
+# archive.org item-level provenance. A per-venue concert taper (a dated
+# "ob1995-10-20" / "*.aud" upload), a soundboard, or a radio/DJ rip is a
+# LIVE recording, not the standard CD cut - but its per-file names carry
+# the song title exactly like a rip ("339 Just Another Day.flac"), so the
+# per-file filters cannot tell them apart and the tapers outrank studio
+# items. Decide from the item identifier + title + creator ONLY: never
+# the free-text description (every reissue mentions a concert) and never
+# the separate date FIELD (a commercial album carries a YYYY-MM-DD release
+# date there - Dead Man's Party 1985-10-28). A concert upload instead
+# encodes its show date in its IDENTIFIER/title (taper convention), which
+# no studio pressing does.
+_DATE_ID = re.compile(r"\d{4}-\d{2}-\d{2}")
+_LIVE_WORD = re.compile(r"(?i)\blive\b")
+_SHOW_TOKEN = re.compile(
+    r"(?i)full show|full concert|farewell show|set ?list|soundboard|"
+    r"audience recording|dvd-?r\b|\btour\b|\btaper\b")
+_VENUE = re.compile(
+    r"(?i)theatre|theater|amphitheat(er|re)|palladium|warfield|aquarius|"
+    r"irvine|euterpion|ballpark|house of blues|fillmore|olympia|civic|auditorium")
+_RADIO_CREATOR = re.compile(
+    r"(?i)\bradio\b|\bfm\b|\bdj\b|on ?air|airwaves|pop defect|prog ?rock")
+
+
+def _archive_is_live_item(ident: str, title: str, creator: str,
+                          artist_words: set[str]) -> bool:
+    """True if the archive.org ITEM is a concert/soundboard/radio source.
+    The whole item is then a live recording, so every file in it is
+    dropped; the classifier never inspects individual files."""
+    low_ident = ident.lower()
+    stem = low_ident[:-4] if low_ident.endswith(".aud") else low_ident
+    if low_ident.endswith(".aud") or _DATE_ID.search(stem):
+        return True  # taper identifier: ob1995-10-20, ob1993-01-08.aud
+    t = title.lower()
+    if _SHOW_TOKEN.search(t):
+        return True
+    if "live" not in artist_words and _LIVE_WORD.search(t):
+        return True  # a band named "Live" keeps its studio albums
+    # A concert-hall/venue name in an audio ITEM title denotes a live
+    # recording: a commercial studio album is never named after the hall.
+    if _VENUE.search(t):
+        return True
+    # A show date in the title only means a taper with a venue or live/show
+    # token alongside it; a reissue titled with a date alone is kept.
+    if _DATE_ID.search(t) and (_VENUE.search(t) or _LIVE_WORD.search(t)
+                               or _SHOW_TOKEN.search(t)):
+        return True
+    if _RADIO_CREATOR.search(creator):
+        return True
+    return False
+
+
 def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]:
     """Audio items first; full-album uploads rarely mention individual
     track names in item metadata, so the album query lets the per-file
@@ -256,12 +310,15 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
     are the fallback when no audio upload exists - the transcode step
     extracts the audio track, which for a video release is the studio
     recording. All queries merge; the per-file filters rank the rest."""
-    queries = [f"{artist} {title} AND mediatype:(audio)"]
+    queries = [f"{_query_text(artist)} {_query_text(title)} AND mediatype:(audio)"]
     if album:
-        queries.append(f"{artist} {album} AND mediatype:(audio)")
-    queries.append(f"{artist} {title} AND mediatype:(movies)")
+        queries.append(f"{_query_text(artist)} {_query_text(album)} "
+                       "AND mediatype:(audio)")
+    queries.append(f"{_query_text(artist)} {_query_text(title)} "
+                   "AND mediatype:(movies)")
     cands: list[Candidate] = []
     bad = make_bad_filter(artist)
+    artist_words = set(_words(artist))
     want = _norm(title)
     for q in queries:
         url = ("https://archive.org/advancedsearch.php?"
@@ -287,6 +344,10 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
                 continue
             md = meta.get("metadata") or {}
             uploader = str(md.get("creator") or md.get("creator__sort") or "")
+            item_title = str(md.get("title") or "").strip()
+            if _archive_is_live_item(ident, item_title, uploader,
+                                     artist_words):
+                continue  # whole item is a concert/soundboard/radio source
             for f in meta.get("files") or []:
                 name = f.get("name") or ""
                 if "." not in name:
@@ -306,6 +367,7 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
                     title=base,
                     uploader=uploader,
                     duration=_parse_length(f.get("length")),
+                    release=item_title,
                 ))
     return cands
 
@@ -334,6 +396,20 @@ def _nzb_get(url: str, timeout: int, tries: int = 4) -> bytes:
     raise RuntimeError("unreachable")
 
 
+def _query_text(s: str) -> str:
+    """Search-query form of an artist/title/album string: apostrophes
+    (straight and typographic) removed. Both nzb.life and archive.org
+    tokenize on the apostrophe, so "Dead Man's Party" ANDs into
+    "Dead / Man / s / Party" and drowns in noise - it returns only the
+    loosely-matched promo/bootleg docs and MISSES the clean scene rip
+    titled "Dead Mans Party" and the studio album item titled
+    "Oingo Boingo - Dead Man's Party" (proven: 3 noise docs vs the studio
+    rips once stripped). MusicBrainz returns the curly form. The stored
+    album keeps its apostrophe (it is only ever compared through
+    _norm, which drops punctuation); this touches the query string only."""
+    return s.replace("'", "").replace("\u2019", "")
+
+
 def _nzb_search(artist: str, title: str, year: str = "") -> list[Candidate]:
     """Newznab search on nzb.life, audio only (cat 3000). The original
     release year is a relevance hint: scene titles carry the pressing
@@ -349,7 +425,7 @@ def _nzb_search(artist: str, title: str, year: str = "") -> list[Candidate]:
 
 def _nzb_query(q: str) -> list[Candidate]:
     params = urllib.parse.urlencode(
-        {"apikey": NZB_APIKEY, "t": "search", "q": q, "cat": "3000"})
+        {"apikey": NZB_APIKEY, "t": "search", "q": _query_text(q), "cat": "3000"})
     xml = _nzb_get(f"{NZB_API}/api?{params}", SEARCH_TIMEOUT).decode(
         "utf-8", "replace")
     cands: list[Candidate] = []

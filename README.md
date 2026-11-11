@@ -20,10 +20,17 @@ wraps the chat endpoints, `app.py` is the CLI, `web.py` the HTTP API + UI.
 
 1. **discover** — an LLM resolves the rough name to
    `{artist, title, year, cd_year, album}`. An explicitly typed
-   `Artist - Title` is *pinned*: the LLM may fix a wrong artist name but may
-   not swap the song for a more famous one with a similar title, and if it
-   does, the requested values are kept and the year/album are re-derived from
-   MusicBrainz. `--no-llm` uses a heuristic parse instead.
+   `Artist - Title (YYYY)` is *pinned*: the LLM may fix a wrong artist name
+   but may not swap the song for a more famous one with a similar title, and
+   if it does, the requested values are kept; the typed year is kept as
+   ground truth (the LLM's year is nondeterministic) and the album is
+   re-derived from MusicBrainz for that year. With **no** typed year the
+   LLM's guess is too flaky to trust, so the search year comes from
+   MusicBrainz instead: the date of the first *studio* album the song
+   appeared on (live/bootleg releases are skipped). That single year both
+   scopes the album re-derivation and seeds the duration anchor — the two
+   signals that pick the studio rip over a concert take. `--no-llm` uses
+   a heuristic parse instead.
 
 2. **search** — sources in priority order, best-to-worst, censored/altered
    uploads filtered out of the file pool:
@@ -37,14 +44,24 @@ wraps the chat endpoints, `app.py` is the CLI, `web.py` the HTTP API + UI.
    Selection is by **per-file** names, never the release title (scene names
    are false fronts), lossless CD rips before lossy, audio before video,
    oldest re-upload before fresh one. Up to `TUNESTER_TRIALS` (5) candidates
-   per source.
+   per source. Two sourcing guards apply to album/CD-rip finding: archive
+   **concert/soundboard/radio items are dropped whole** on item
+   identifier+title+creator (`ob1993-01-08.aud`, `Live at …`, a `PoP dEFECT
+   RADIO` creator) before any of their per-file uploads are considered — a
+   taper names its files exactly like a rip, so per-file filters alone pick
+   it — and album names have apostrophes stripped from the search queries on
+   both nzb.life and archive.org (a `Dead Man's Party` query tokenizes into
+   noise and misses the studio rips titled `Dead Mans Party`).
 
 3. **verify** — the QC gate on each downloaded candidate, in order: ffprobe
    sanity (decodable, ≥20 s, not truncated) → **duration anchor** from
-   MusicBrainz (the LLM is never consulted about length: it fabricates one and
-   rationalizes the file it is shown) → **AcoustID content gate** (chromaprint
-   fingerprint — the only check that catches a file correctly named *and*
-   correctly long whose audio is a different song) → **live-version rejection**,
+   MusicBrainz, applied to every candidate (the LLM is never consulted about
+   length: it fabricates one and rationalizes the file it is shown; an
+   archive file's own claimed length only feeds the truncation check, never
+   the anchor, so a concert taper cannot pass by matching itself) →
+   **AcoustID content gate** (chromaprint fingerprint — the only check that
+   catches a file correctly named *and* correctly long whose audio is a
+   different song) → **live-version rejection**,
    which does not take the model's word for it: a fingerprint identifying a
    `(Live at …)` take is refused, and so is any reply whose `version` is
    clean/radio/live/cover/remix even when the model also answered `match=true`
