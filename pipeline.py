@@ -1295,6 +1295,36 @@ def _nzb_file_name(subject: str) -> str:
     parts = subject.split()
     return parts[-1] if parts else "file"
 
+# Characters a single file name cannot carry: path separators (a `/` in a
+# name makes `arc / name` a subpath of a directory that does not exist)
+# plus NUL/control chars. Runs collapse to one `_` so no name grows a
+# string of separators and the mapping stays pure.
+_PART_UNSAFE_RE = re.compile(r"[/\\\x00-\x1f\x7f]+")
+
+
+def sanitize_part_name(name: str) -> str:
+    """Force a candidate part name to one flat file name: directory
+    components and separator/control characters collapsed to `_`, leading
+    and trailing dots/spaces stripped, `part` when nothing usable is
+    left. Pure, so the same subject always maps to the same name and a
+    re-fetch rebuilds the same layout."""
+    return _PART_UNSAFE_RE.sub("_", name).strip(". ") or "part"
+
+
+# Subjects collide after sanitizing: a xpost can post the same part twice
+# and a plain write would overwrite the earlier part's bytes. Suffix the
+# first free name with `.2`, `.3`, ...
+def _unique_part_name(arc: Path, name: str, used: set[str]) -> str:
+    """`name` with `.2`, `.3`, ... appended until neither `arc` nor `used`
+    claims it. `used` also covers names reserved earlier in the same
+    fetch; deterministic, so a re-fetch lays out the same names."""
+    stem, n = name, 1
+    while name in used or (arc / name).exists():
+        n += 1
+        name = f"{stem}.{n}"
+    used.add(name)
+    return name
+
 
 # Raw-8bit yEnc variant (WtFnZb-style): part bytes are stored shifted by
 # +0x2a, and stored bytes in {NUL, TAB, LF, CR, SP, '.', '='} are written as
@@ -1407,6 +1437,57 @@ def _nzb_album_file(manifest: bytes, target: Target,
     return None
 
 
+def _album_credit_names(target: Target, log) -> list[str]:
+    """Artist names MusicBrainz credits pressings of `target.album` to,
+    most-pressed first, with `target.artist` excluded; [] when unknown.
+
+    The requested artist is not always the album's artist: a duet or
+    featured track sits on the CO-ARTIST's album. "Phil Collins - Easy
+    Lover" is track 6 of Philip Bailey's "Chinese Wall" (MusicBrainz
+    credits the recording to 'Philip Bailey & Phil Collins'), so the album
+    search under the requested artist - "Phil Collins Chinese Wall" -
+    matches no scene release title at all, and the only genuine album rip
+    on Usenet ("Philip Bailey-Chinese Wall-CD-FLAC-1984-CALiFLAC", carrying
+    06-philip_bailey-easy_lover_(duet_with_phil_collins).flac) was never
+    even a candidate (2026-11-12): the album cut stayed unreachable, so the
+    349 s anchor-era cover take that the user heard as "some random dude
+    pretending to sing it" is what the library kept.
+    """
+    if not target.album:
+        return []
+    q = urllib.parse.urlencode({
+        "query": f'recording:"{target.title}" AND artist:"{target.artist}"',
+        "fmt": "json", "limit": 60, "inc": "releases"})
+    data = _mb_get(f"/recording?{q}", log)
+    if not data:
+        return []
+    a, t, al = (_norm(target.artist), _norm(target.title),
+                _norm(target.album))
+    display: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for r in data.get("recordings", []):
+        if _norm(str(r.get("title") or "")) != t:
+            continue
+        ac = _norm(" ".join(x.get("name", "")
+                            for x in r.get("artist-credit", [])))
+        if not (a in ac or ac in a):
+            continue
+        for rel in r.get("releases") or []:
+            if _norm(str(rel.get("title") or "")) != al:
+                continue
+            for e in rel.get("artist-credit") or []:
+                name = str(e.get("name") or "").strip()
+                n = _norm(name)
+                # 'Various Artists' compilations name no artist worth
+                # searching; a name inside the target artist is the same
+                # artist in another spelling and adds no release.
+                if not n or n == "variousartists" or n in a or a in n:
+                    continue
+                display.setdefault(n, name)
+                counts[n] = counts.get(n, 0) + 1
+    return [display[n] for n in sorted(counts, key=lambda n: (-counts[n], n))]
+
+
 def _nzb_album_cands(target: Target, seen: set[str],
                      log) -> list[Candidate]:
     """Extra nzb search by original album name + target year (so the
@@ -1414,15 +1495,33 @@ def _nzb_album_cands(target: Target, seen: set[str],
     lists a clean media file matching the song title is returned (the
     track is then plucked at download). Up to 10 releases are NZB-checked
     (cached manifests are free); bad-curation false fronts - e.g. 2014
-    reissues titled "(2001)" - can occupy the top ranks."""
+    reissues titled "(2001)" - can occupy the top ranks.
+
+    The album is searched under the target artist AND under the artists
+    MusicBrainz credits its pressings to (`_album_credit_names`): scene
+    releases are titled by the ALBUM's artist, and a duet sits on the
+    co-artist's album, so "Phil Collins Chinese Wall" matches no release
+    while "Philip Bailey Chinese Wall" finds the CD rip that contains the
+    song."""
     if not target.album:
         return []
     src = next(s for s in SOURCES if s.kind == "nzb")
-    try:
-        cands = search_candidates(src, target.artist, target.album, None,
-                                  year=target.year, album=target.album)
-    except Exception as e:
-        log(f"      album search failed: {e}")
+    names = [target.artist] + _album_credit_names(target, log)[:2]
+    cands: list[Candidate] = []
+    seen_urls: set[str] = set()
+    for name in names:
+        try:
+            got = search_candidates(src, name, target.album, None,
+                                    year=target.year, album=target.album)
+        except Exception as e:
+            log(f"      album search failed: {e}")
+            continue
+        for c in got:
+            if c.url not in seen_urls:
+                seen_urls.add(c.url)
+                cands.append(c)
+    if not cands:
+        log("      album pluck: no release titled the album")
         return []
     bad = make_bad_filter(target.artist)
 
@@ -1594,6 +1693,7 @@ def _nzb_archive_pluck(files, url: str, tmp: Path, target: Target,
         log(f"        NNTP connect failed: {e}")
         return None
     cur_grp = None
+    used = set()  # part names already written this fetch
     try:
         for subj, grp, segs in files:
             if grp and grp != cur_grp:
@@ -1615,7 +1715,14 @@ def _nzb_archive_pluck(files, url: str, tmp: Path, target: Target,
                     log(f"        part {n}/{len(segs)}: yEnc/CRC error")
                     return None
                 blob += part
-            (arc / _nzb_file_name(subj)).write_bytes(blob)
+            # Guard the last-token fallback: a bare-file release posts its
+            # only yEnc part as `... yEnc 1518 (1/1)`, so `_nzb_file_name`
+            # returns `(1/1)` and `arc / "(1/1)"` names a missing
+            # subdirectory - ENOTDIR out of the write, reported by tune()
+            # as "download failed", abandoning the whole release.
+            pname = _unique_part_name(
+                arc, sanitize_part_name(_nzb_file_name(subj)), used)
+            (arc / pname).write_bytes(blob)
     finally:
         try:
             conn.quit()
@@ -1793,6 +1900,24 @@ def _live_marked(title: str, dis: str) -> bool:
     return bool(re.search(r"\blive\b", f"{title} {dis}", re.I))
 
 
+def _acoustid_credit_names(x) -> list[str]:
+    """Attribution names carried by a MusicBrainz credit value,
+    flattened recursively: a plain string; a dict with `name` and/or a
+    nested `credit` (the join-phrase chain MusicBrainz uses for
+    multi-artist credits); a list of those. In credit order."""
+    if isinstance(x, str):
+        return [x.strip()] if x.strip() else []
+    if isinstance(x, dict):
+        return _acoustid_credit_names(x.get("name")) \
+            + _acoustid_credit_names(x.get("credit"))
+    if isinstance(x, list):
+        out: list[str] = []
+        for item in x:
+            out += _acoustid_credit_names(item)
+        return out
+    return []
+
+
 def _acoustid_identify(path: Path, target: Target) -> dict | None:
     """Fingerprint `path` and ask AcoustID what it is. None when the check
     could not run (no key, fpcalc missing, service failure/queued) - the
@@ -1800,7 +1925,9 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
 
       matched: (artist, title, disambiguation, conf) of the highest-scoring
                cluster containing ANY MusicBrainz-linked recording that
-               matches the target - a misattributed copy can rank first in
+               matches the target - artist is the CREDIT that matched
+               it, not necessarily the recording's first credit (the
+               credit scan below). A misattributed copy can rank first in
                the cluster (the genuine Men Without Hats "The Safety
                Dance" was outranked by a "SIRCH - Safety Dance" entry for
                the same audio, 2026-10-21), so every cluster is searched.
@@ -1832,6 +1959,7 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
     m_live = 0  # matched's live-mark, for the attribution tie-break
     nrecs = 0
     top = ""
+    tnorm = _norm(target.artist)  # target artist, for the credit ranking
     for cl in clusters:
         conf = float(cl.get("score") or 0.0)
         best = max(best, conf)
@@ -1850,7 +1978,36 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
             if not top:
                 top = f"{artist} - {title}" if artist else title
             dis = str(rec.get("disambiguation") or "")
-            if _acoustid_matches(artist, title, target):
+            # EVERY artist credit has to be scanned, not just artists[0]:
+            # the AcoustID meta=recordings payload lists the recording's
+            # MusicBrainz artist credits, and artists[0] is only the
+            # FIRST of them. "Phil Collins - Easy Lover" is credited to
+            # the duet 'Philip Bailey & Phil Collins' (the studio
+            # recording sits on Philip Bailey's Chinese Wall), so a
+            # first-credit-only test never matched the target anywhere in
+            # the credit and the genuine 100% studio CD rip was rejected
+            # as "identifies as Philip Bailey - Easy Lover" (2026-11-12)
+            # - a famous single could never deliver. Any credit that
+            # matches is the target. `top` still reports artists[0], so
+            # a rejection names what the payload leads with.
+            whole = " & ".join(_acoustid_credit_names(rec.get("credit")))
+            # Best-matching credit wins: longest normalized containment
+            # of the target artist, ties to the SHORTEST name - the
+            # tightest attribution, so a matched duet logs as
+            # 'Phil Collins - Easy Lover' rather than the whole credit
+            # line. _acoustid_matches already proved one name contains
+            # the other, so the containment length always exists.
+            pick: str = ""
+            pick_rank: tuple[int, int] | None = None
+            for cand in (*_acoustid_credit_names(rec.get("artists")), whole):
+                if not cand or not _acoustid_matches(cand, title, target):
+                    continue
+                nc = _norm(cand)
+                hit = len(tnorm) if tnorm in nc else len(nc)
+                cand_rank = (-hit, len(nc))
+                if pick_rank is None or cand_rank < pick_rank:
+                    pick, pick_rank = cand, cand_rank
+            if pick:
                 # Higher score wins; on the SAME score the non-live
                 # attribution wins, because a near-identical live take is
                 # routinely linked into the studio cluster: the official
@@ -1862,7 +2019,7 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
                 # (2026-11-11) - the very CD rips the pipeline is for.
                 rank = (conf, 0 if _live_marked(title, dis) else 1)
                 if matched is None or rank > (matched[3], m_live):
-                    matched = (artist, title, dis, conf)
+                    matched = (pick, title, dis, conf)
                     m_live = rank[1]
     return {"matched": matched, "best": best, "nrecs": nrecs, "top": top}
 
@@ -1959,14 +2116,14 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         expect = target.mb_duration or _consensus_duration(
             target.artist, target.title)
         why = "MusicBrainz/other sources"
-    if expect and abs(info["duration"] - expect) > 15.0:
-        return False, "duration", (
-            f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
     # Objective facts the LLM cannot see, recorded here for the version
     # veto below: whether the length agrees with the studio anchor, and
     # (set in the AcoustID block) whether the fingerprint proves a clean
     # match to the studio recording rather than a live take.
     anchored = bool(expect and abs(info["duration"] - expect) <= 15.0)
+    if expect and abs(info["duration"] - expect) > 15.0:
+        return False, "duration", (
+            f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
     studio_confirmed = False
     ident = _acoustid_identify(path, target)
     if ident is None:
@@ -2044,11 +2201,11 @@ def verify_download(path: Path, cand: Candidate, target: Target,
             f"recording; LLM '{version}' veto overruled")
     if not d.get("match"):
         return False, "llm", f"{version}: {d.get('reason', 'rejected')}"
+    # The match flag is not trusted on its own: the LLM sometimes
+    # answers match=true while labeling the version live/cover/
+    # remix. Only the studio CD recording is a deliverable, so the
+    # version vocabulary is enforced regardless of the match flag.
     if version in ("clean", "radio", "live", "cover", "remix"):
-        # The match flag is not trusted on its own: the LLM sometimes
-        # answers match=true while labeling the version live/cover/
-        # remix. Only the studio CD recording is a deliverable, so the
-        # version vocabulary is enforced regardless of the match flag.
         return False, "llm", (
             f"{version}: " + (d.get("reason") or "not a studio recording"))
     return True, "llm", ""

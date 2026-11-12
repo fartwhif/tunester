@@ -564,6 +564,15 @@ bare-file path. Image ships `unar`, `p7zip-full`, `par2`,
 `libchromaprint-tools`. Scene RAR volume naming varies (FORSAKEN's rip = one
 `.rar` + `.r00…` siblings), so ALL files are fetched, not just `*.rar` —
 `unar` resolves sibling volumes from the working directory.
+Part names are subject text, so the write is guarded: `sanitize_part_name`
+flattens whatever `_nzb_file_name` returned (`/`, `\`, NUL/controls -> `_`,
+leading/trailing dots+spaces stripped, `part` when nothing usable is left)
+because a bare-file xpost posts its only yEnc part as `... yEnc 1518 (1/1)`:
+`arc / "(1/1)"` hit ENOTDIR and tune() logged it as "download failed",
+abandoning the release (2026-11-12, Easy Lover). `_unique_part_name` appends
+`.2`, `.3`, ... on a name collision so a duplicate part never overwrites
+bytes. Both are deterministic (same subject -> same name), and the track
+ranking runs on the EXTRACTED tree, so these names are layout-only.
 
 ## Deploy (any code change)
 ```
