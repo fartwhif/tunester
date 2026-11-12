@@ -345,8 +345,26 @@ NZB-checked (cache-first `_nzb_manifest`); the first release whose file
 list contains a clean file with the song title becomes the pluck
 candidate and is **tried before** direct search hits — the original
 album is the canonical source. Direct hits remain the fallback.
-Early-return on the first verified release caps quota spend.
 
+**Co-artist albums (2026-11-12)**: the album is also searched under the
+artists MusicBrainz credits its pressings to (`_album_credit_names`, top 2
+by pressing count, 'Various Artists' + the target's own name spellings
+excluded). Scene releases are titled `Artist-Album-...` with the ALBUM's
+artist, and a duet or featured track sits on the co-artist's album, so the
+requested artist can never find it: "Phil Collins - Easy Lover" is track 6
+of Philip Bailey's "Chinese Wall" (the recording is credited to 'Philip
+Bailey & Phil Collins'; the CD rip on nzb.life is
+`Philip Bailey-Chinese Wall-CD-FLAC-1984-CALiFLAC` and the track file is
+`06-philip_bailey-easy_lover_(duet_with_phil_collins).flac`). "Phil Collins
+Chinese Wall" returned nothing, the album cut stayed unreachable, and the
+library kept a 349 s zero-coverage cover take (delivered 2026-11-10, before
+the zero-coverage reject existed, which is what the user heard as "some
+random dude pretending to sing it"). After the fix the pluck finds the rip
+in 33 s and the delivery is the 306 s album cut, fingerprint-confirmed
+against 'Phil Collins - Easy Lover' at 0.9889. The gate stack already
+handles the co-artist credits: `_acoustid_identify` scans every recording
+artist-credit in the cluster, and the LLM gate accepted the Bailey-credited
+file name because the named file itself carries the duet credit.
 ## Usenet curation pitfalls (names are false fronts)
 - 12" maxis are named after the A-side: `Beck-Loser-VLS-FLAC-1994-ERP`
   contains `b1-beck-alcohol.flac` and `b2-beck-fume.flac` with ID3s
