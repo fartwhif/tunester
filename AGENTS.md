@@ -200,8 +200,9 @@ which are now the wrong ones).
 Title" from the raw input (same regex as the --no-llm heuristic;
 free-form descriptions return "" - there the LLM has the wheel). The
 requested title is cleaned first: a repeated artist prefix ("Gorillaz -
-Gorillaz - Feel Up (HD)" -> title "Feel Up"), a trailing year, and
-technical tags (`_TITLE_TAGS`: HD/320kbps/Official Music Video/...).
+Gorillaz - Feel Up (HD)" -> title "Feel Up"), a trailing year, and trailing
+technical noise via `_strip_noise_tags` (`_TITLE_TAGS`: HD/320kbps/Official
+Music Video/…; `_REMASTER_TAGS`: a remaster label — see the next section).
 `_artist_matches` fuzzy-compares with normalized equality / containment /
 SequenceMatcher >= 0.8 (misspellings, casing, punctuation, leading
 articles, name changes like "Kanye West" ~ "Ye" are the SAME; "Roy
@@ -214,6 +215,41 @@ substituted song); the MB lookups re-derive them. Outcome for an unknown
 track: an honest "all sources exhausted" instead of a different song's
 file. The DISCOVER_SYSTEM prompt also forbids both substitutions (soft);
 the pins are the hard guarantee (LLM output is nondeterministic).
+
+## Remaster labels are noise (`_strip_noise_tags`, 2026-11-13)
+YouTube/Spotify put the reissue's remaster label in the TITLE slot:
+`Underworld - Cowgirl (Remastered)`. A remaster is the SAME studio
+recording pressed again and MusicBrainz titles the recording without the
+label, so a pinned `Cowgirl (Remastered)` names no recording at all: no
+year, no album, no duration anchor, every search query carries the label
+and returns 0 hits — the track tunes to nothing (observed 2026-11-13:
+`Underworld - Cowgirl (Remastered)` and `Leftfield - Open Up
+(Remastered)`, which the discover LLM had already identified correctly as
+`Cowgirl` / `Open Up` — the typed pin, not the LLM, was the failure).
+`_strip_noise_tags` peels a TRAILING group when it BOTH mentions a
+remaster (`\bremaster\w*\b` lookahead) AND consists only of reissue noise
+words (`_REMASTER_NOISE`: ordinals, remaster/remastered/remasters/
+mastered, anniversary, edition, version, digital, expanded, deluxe,
+reissue, original recording, the/of/and, plus the quality/format words).
+So `(Remastered)`, `(2011 Remastered)`, `(Remastered Version)`,
+`(Remastered, 2011)`, `(Digital Remaster)`, `(30th Anniversary Remastered
+Deluxe Edition)`, `(2011 Remaster of the Original Recording)` peel, while
+a recording-identity parenthetical survives untouched — `(Radio Edit)`,
+`(Kurayamino Mix)`, `(Shove It)`, `(Single Edit)`, `(Live)`, `(Remix)`,
+`(Remixes)`, `(Acoustic)`, and a title that merely contains the word
+(`Song (The Remastered Master)`, `Born to Remaster`, `Song (Remix
+Remastered)`). A group after a NON-noise parenthetical is not trailing, so
+`Song (Remastered) (Live)` keeps both. Stacked tags peel in a loop (up to
+3 passes) so `(320 kbps) (HD)` and `(Remastered) (1994)` both reduce.
+The remaster YEAR is never the song's year: `_requested_year` honors only
+a bare trailing `(YYYY)`, so `(2011 Remastered)`/`(Remastered 2011)` can
+not pin a reissue date, while `Cowgirl (Remastered) (1994)` keeps 1994.
+`discover` also strips the label from the LLM's title, so a LLM answer of
+`Cowgirl (Remastered)` no longer drops the pin (which would discard the
+LLM's album/year). `_scrub_tracklist` strips the same tags from a QUOTED
+listing title before the MusicBrainz confirmation, so
+`"Bad Blood (2005 Remastered)" Ministry` scrubs to
+`Ministry - Bad Blood`.
 
 ## Tracklist-form upload names (`_scrub_tracklist`, 2026-11-13)
 YouTube compilation / film-soundtrack channels name uploads like the
@@ -251,11 +287,13 @@ at the wrong song:
    limit reads as "no such recording" and silently skips the scrub.
 MB unreachable (None) still scrubs on shape alone — a better guess than the
 listing, and every MB lookup downstream is off anyway.
-The quoted text is kept VERBATIM as the title, parentheticals included:
-`(Shove It)` and `(Kurayamino Mix)` ARE part of the MB recording
-(`_requested_title`'s technical-tag strip still runs afterwards). The only
-normalization is whitespace (`\s+` → one space), because YouTube puts a
-nbsp inside these names (`Clubbed to Death\u00a0(Kurayamino Mix)`).
+The quoted text becomes the title VERBATIM except for the trailing
+technical tags `_strip_noise_tags` removes (they would break the exact MB
+confirmation just as they do for a typed name): `(Shove It)` and
+`(Kurayamino Mix)` ARE part of the MB recording and stay;
+`"Bad Blood (2005 Remastered)" Ministry` → `Ministry - Bad Blood`. The
+other normalization is whitespace (`\s+` → one space), because YouTube
+puts a nbsp inside these names (`Clubbed to Death\u00a0(Kurayamino Mix)`).
 
 Verified: 14 controls stay untouched (Reed Waddle `"Lonesome Dove" Live at
 … 2025`, `Queen - Don't Stop Me Now (1975)`, `(Explicit)`, `Artist - "Title"
