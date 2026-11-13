@@ -201,13 +201,53 @@ _TITLE_TAGS = re.compile(
     r"official|mv|video|full\s+song|full|1080p|720p|480p|4k|320\s*kbps|"
     r"256\s*kbps|192\s*kbps|128\s*kbps|320|256|128|mp3|flac|wav|aac|ogg|"
     r"m4a|stereo)\)\s*$", re.I)
+# YouTube / Spotify put the reissue's REMASTER LABEL in the title slot:
+# 'Underworld - Cowgirl (Remastered)'. A remaster is the same studio
+# recording pressed again, and MusicBrainz titles the recording without the
+# label, so a pinned 'Cowgirl (Remastered)' names no recording at all: the
+# year/album derivations and the duration anchor go empty, every search
+# query carries the label and comes back 0 hits, and the track tunes to
+# nothing (2026-11-13: 'Underworld - Cowgirl (Remastered)', 'Leftfield -
+# Open Up (Remastered)', which the discover LLM had already identified
+# correctly as 'Cowgirl' / 'Open Up'). The remaster YEAR is not the song's
+# year either: _requested_year only honors a bare '(YYYY)' group, so
+# '(2011 Remastered)' can never pin a reissue date. Contrast '(Radio Edit)'
+# and a remix, which ARE different recordings and stay in the title.
+# The group must BOTH mention a remaster and consist only of reissue
+# noise words, so '(2011 Remastered, Digital Edition)' and
+# '(Remastered HD)' peel while '(The Remastered Master)' - a title that
+# genuinely contains the word - keeps it.
+_REMASTER_NOISE = (
+    r"(?:\d+(?:st|nd|rd|th)?|remasters?|remastered|remastering|mastered"
+    r"|anniversary|edition|version|digital|expanded|deluxe|reissue(?:d)?"
+    r"|original(?:\s+recording)?|the|of|and"
+    r"|hd|hq|4k|1080p|720p|480p|kbps|bit|mp3|flac|wav|aac|ogg|m4a"
+    r"|stereo|mono)")
+_REMASTER_TAGS = re.compile(
+    r"\s*\((?=[^()]*\bremaster\w*\b)"
+    r"\s*" + _REMASTER_NOISE + r"(?:[\s,.-]+" + _REMASTER_NOISE + r")*\s*\)"
+    r"\s*$", re.I)
+
+
+def _strip_noise_tags(title: str) -> str:
+    """`title` without trailing technical noise: quality/format tags
+    ('(HD)', '(320 kbps)') and a remaster label ('(Remastered)',
+    '(2011 Remastered Version)', '(20th Anniversary Remastered Edition)').
+    Stacked tags peel until stable. Recording-identity parentheticals -
+    '(Radio Edit)', '(Kurayamino Mix)', '(Shove It)' - are NOT noise."""
+    for _ in range(3):
+        cleaned = _REMASTER_TAGS.sub("", _TITLE_TAGS.sub("", title))
+        if cleaned == title:
+            break
+        title = cleaned
+    return title.strip()
 
 
 def _requested_title(raw: str) -> str:
     """The title the user explicitly typed in 'Artist - Title' form,
     cleaned of a repeated artist prefix ("Gorillaz - Gorillaz - Feel Up"),
-    a trailing year, and technical tags like '(HD)'. '' for free-form
-    descriptions (where the LLM picks the title)."""
+    a trailing year, and technical tags like '(HD)' or '(Remastered)'. ''
+    for free-form descriptions (where the LLM picks the title)."""
     m = re.match(r"^\s*(?:the\s+)?(.+?)\s+[-\u2013\u2014:]\s+(.+?)\s*$", raw.strip())
     if not m:
         return ""
@@ -218,12 +258,7 @@ def _requested_title(raw: str) -> str:
     if artist:
         title = re.sub(rf"^{re.escape(artist)}\s+[-\u2013\u2014:]\s*",
                        "", title, flags=re.I)
-    for _ in range(2):
-        cleaned = _TITLE_TAGS.sub("", title)
-        if cleaned == title:
-            break
-        title = cleaned
-    return title.strip()
+    return _strip_noise_tags(title)
 
 
 def _requested_year(raw: str) -> str:
@@ -330,9 +365,10 @@ def _scrub_tracklist(raw: str, log=print) -> str:
          2:'/'Side A' marker, or a label ending in '-' / ':' before the
          quote, which is how the channel puts its own name in front;
       3. MusicBrainz confirms that artist for that exact title.
-    The quoted text is the title VERBATIM, parentheticals included: '(Shove
-    It)' and '(Kurayamino Mix)' are part of the MusicBrainz recording, while
-    _requested_title strips the technical tags it strips for everyone else.
+    The quoted text is the title VERBATIM except for the trailing technical
+    tags `_strip_noise_tags` removes for everyone else: '(Shove It)' and
+    '(Kurayamino Mix)' ARE part of the MusicBrainz recording, a '(2005
+    Remastered)' label is not.
     """
     m = _QUOTED.search(raw)
     if not m:
@@ -348,6 +384,13 @@ def _scrub_tracklist(raw: str, log=print) -> str:
         return ""
     if not _tail_is_artist_name(tail):
         return ""
+    # A remaster label INSIDE the quotes is the same reissue noise as a
+    # typed one (see `_REMASTER_TAGS`): the listing copied it from the
+    # reissue, MusicBrainz titles the recording without it, so the
+    # confirmation and the scrubbed name both use the stripped form -
+    # '"Bad Blood (2005 Remastered)" Ministry' scrubs to 'Ministry - Bad
+    # Blood'. Identity parentheticals survive the strip untouched.
+    title = _strip_noise_tags(title)
     artist = musicbrainz_listing_artist(title, tail, log)
     if artist is None:
         # MusicBrainz unreachable: the shape is still a better guess than
@@ -403,7 +446,11 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     if use_llm:
         d = llm.chat_json(DISCOVER_SYSTEM, raw)
         artist = str(d.get("artist") or "").strip()
-        title = str(d.get("title") or "").strip()
+        # A remaster label is noise wherever it came from - the LLM echoes
+        # '(Remastered)' from the input just as happily as YouTube writes it
+        # (see `_REMASTER_TAGS`), and a title carrying it names no
+        # MusicBrainz recording.
+        title = _strip_noise_tags(str(d.get("title") or ""))
         year = _clean_year(str(d.get("year") or ""))
         cd_year = _clean_year(str(d.get("cd_year") or ""))
         album = str(d.get("album") or "").strip()
@@ -455,7 +502,8 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
         if not m:
             raise TuneError("cannot parse 'Artist - Title' without the LLM; "
                             "rerun without --no-llm")
-        artist, title, album = m.group(1).strip(), m.group(2).strip(), ""
+        artist, title = m.group(1).strip(), _strip_noise_tags(m.group(2))
+        album = ""
     # Without a typed year the only year driving musicbrainz_album's
     # +/-1 window and musicbrainz_duration's cluster is the discover LLM's
     # guess - nondeterministic (the same pinned "Oingo Boingo - Just
