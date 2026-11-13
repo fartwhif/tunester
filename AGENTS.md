@@ -265,11 +265,23 @@ Fighters`); `discover` (heuristic, no LLM) on all 13 quote-bearing
 GrabbyTube names returns the real artist/title/year for 12 (`Ministry - Bad
 Blood 1999`, `The Prodigy - Mindfields 1997`, `Deftones - My Own Summer
 (Shove It) 1997`, `RoB-D - Clubbed to Death (Kurayamino Mix) 1999`, …) and
-leaves the live one as-is. End to end: the Matrix Track 9 name delivered
-`Deftones - My Own Summer (Shove It) (1997).mp3` in 69 s via the
-`Deftones-Around The Fur-1997-EOS` album pluck, AcoustID 98% studio match —
-the first time that file was reachable at all, because the target artist
-used to be `Flix Soundtracks`.
+leaves the live one as-is. Batch through GrabbyTube (the 12 Matrix tracks,
+every one `fixup` with `artist="Flix Soundtracks"` before): 8 replaced with
+verified deliveries (`Ministry - Bad Blood (1999)`, `Propellerheads -
+Spybreak! (Short One) (1998)`, `Deftones - My Own Summer (Shove It) (1997)`
+via the `Deftones-Around The Fur-1997-EOS` album pluck at AcoustID 98%,
+`Hive - Ultrasonic Sound (2003)`, `Rage Against the Machine - Wake Up
+(1992)`, `Meat Beat Manifesto - Prime Audio Soup (1998)`, `Lunatic Calm -
+Leave You Far Behind (1997)` - plus one re-run whose only earlier failure
+was an LLM 504), and 4 honest `fixup`-only results whose names are now the
+real songs: `The Prodigy - Mindfields` and `Marilyn Manson - Rock Is Dead`
+(every candidate rejected for zero AcoustID coverage), `Rob Zombie -
+Dragula (Hot Rod Herman Remix)` and `Monster Magnet - Look to Your Orb for
+the Warning (Radio Edit)` (non-studio versions, so unrecoverable by
+design). The catalog's `author`/`title` carry the scrubbed values now, so
+the library no longer shows the listing line, and the only quote-bearing
+name left in the catalog is the live Reed Waddle one the scrub correctly
+leaves alone.
 
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
