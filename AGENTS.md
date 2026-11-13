@@ -37,11 +37,21 @@ entry (`_cache_write`):
   `ARTIST - TITLE (YEAR).mp3` names, runs `check_output` and the
   fingerprint mismatch/live check on each — a seeded library file is
   unverified user input — counts stored / skipped / already-in-store).
-  Known limit of the exact-title key: a parenthetical **subtitle** the LLM
-  includes or drops run to run ("I Wanna Dance with Somebody" vs "(Who Loves
-  Me)", 2026-11-10) is a separate entry and a second file. Dropping paren
-  groups from the key is NOT safe — "(Live at …)", "(Reprise)" and a genuine
-  B-side live there.
+  Since the 2026-11-13 wrapper engine the key risk is smaller but
+  real in a new way: every RECOGNIZED label group (venue, remaster,
+  format, rendition) is stripped before discovery, so the old
+  `(Live at …)`-carries-a-genuine-live-recording case can no longer
+  reach the key as a title — MB-titled live-only songs now key as
+  their bare title. A credit strip goes further: `Dark Horse` keys
+  the same entry for the album cut AND for the recording MB titles
+  `Dark Horse (feat. Juicy J)` — the first-verified variant serves
+  both. The 2026-11-11 AcoustID re-verification on hits (fingerprint
+  objection + the ±15 s anchor comparison above) is what keeps a
+  wrong-variant hit from being delivered as-is. Residual known limit:
+  a parenthetical **subtitle** the ladder confirms or peels
+  differently run to run (MB unreachable) — "I Wanna Dance with
+  Somebody" vs "(Who Loves Me)", 2026-11-10 — is a separate entry
+  and a second file.
 `--no-cache` = `Options.use_cache=False` skips reads AND writes in both
 stores. `_cache_evict` caps both subtrees at `TUNESTER_CACHE_MAX_MB`
 (default 30720) by entry mtime; a hit refreshes mtime so used entries
@@ -198,11 +208,20 @@ downstream gate then targets the wrong song consistently and passes it
 which are now the wrong ones).
 `_requested_artist` / `_requested_title` parse an explicit "Artist -
 Title" from the raw input (same regex as the --no-llm heuristic;
-free-form descriptions return "" - there the LLM has the wheel). The
-requested title is cleaned first: a repeated artist prefix ("Gorillaz -
-Gorillaz - Feel Up (HD)" -> title "Feel Up"), a trailing year, and trailing
-technical noise via `_strip_noise_tags` (`_TITLE_TAGS`: HD/320kbps/Official
-Music Video/…; `_REMASTER_TAGS`: a remaster label — see the next section).
+free-form descriptions return "" - there the LLM has the wheel) - the
+name `discover` hands them has ALREADY been cleaned by the wrapper-junk
+engine (see the next two sections), and `_requested_year` simply returns
+the trailing year group `_unwrap_junk` captured. The requested title is
+additionally cleaned of a repeated artist prefix ("Gorillaz - Gorillaz -
+Feel Up (HD)" -> title "Feel Up"), and a LISTING-style title whose song
+sits in quotes ('"Bad Blood" Ministry', '"Lonesome Dove" Live at ...
+2025') yields the QUOTED CORE plus any groups sitting right behind the
+quote: what trails the quote is either an artist credit - in which case
+`_scrub_tracklist` already rewrote the whole name and this never sees
+it - or unbracketed venue/date noise no group rule can see (the quoted
+text IS the song either way), while a bracketed tail ('"Guaranteed"
+(From Into the Wild)') is an identity candidate the MusicBrainz ladder
+must still judge, so it stays.
 `_artist_matches` fuzzy-compares with normalized equality / containment /
 SequenceMatcher >= 0.8 (misspellings, casing, punctuation, leading
 articles, name changes like "Kanye West" ~ "Ye" are the SAME; "Roy
@@ -216,40 +235,91 @@ track: an honest "all sources exhausted" instead of a different song's
 file. The DISCOVER_SYSTEM prompt also forbids both substitutions (soft);
 the pins are the hard guarantee (LLM output is nondeterministic).
 
-## Remaster labels are noise (`_strip_noise_tags`, 2026-11-13)
-YouTube/Spotify put the reissue's remaster label in the TITLE slot:
-`Underworld - Cowgirl (Remastered)`. A remaster is the SAME studio
-recording pressed again and MusicBrainz titles the recording without the
-label, so a pinned `Cowgirl (Remastered)` names no recording at all: no
-year, no album, no duration anchor, every search query carries the label
-and returns 0 hits — the track tunes to nothing (observed 2026-11-13:
-`Underworld - Cowgirl (Remastered)` and `Leftfield - Open Up
-(Remastered)`, which the discover LLM had already identified correctly as
-`Cowgirl` / `Open Up` — the typed pin, not the LLM, was the failure).
-`_strip_noise_tags` peels a TRAILING group when it BOTH mentions a
-remaster (`\bremaster\w*\b` lookahead) AND consists only of reissue noise
-words (`_REMASTER_NOISE`: ordinals, remaster/remastered/remasters/
-mastered, anniversary, edition, version, digital, expanded, deluxe,
-reissue, original recording, the/of/and, plus the quality/format words).
-So `(Remastered)`, `(2011 Remastered)`, `(Remastered Version)`,
-`(Remastered, 2011)`, `(Digital Remaster)`, `(30th Anniversary Remastered
-Deluxe Edition)`, `(2011 Remaster of the Original Recording)` peel, while
-a recording-identity parenthetical survives untouched — `(Radio Edit)`,
-`(Kurayamino Mix)`, `(Shove It)`, `(Single Edit)`, `(Live)`, `(Remix)`,
-`(Remixes)`, `(Acoustic)`, and a title that merely contains the word
-(`Song (The Remastered Master)`, `Born to Remaster`, `Song (Remix
-Remastered)`). A group after a NON-noise parenthetical is not trailing, so
-`Song (Remastered) (Live)` keeps both. Stacked tags peel in a loop (up to
-3 passes) so `(320 kbps) (HD)` and `(Remastered) (1994)` both reduce.
-The remaster YEAR is never the song's year: `_requested_year` honors only
-a bare trailing `(YYYY)`, so `(2011 Remastered)`/`(Remastered 2011)` can
-not pin a reissue date, while `Cowgirl (Remastered) (1994)` keeps 1994.
-`discover` also strips the label from the LLM's title, so a LLM answer of
-`Cowgirl (Remastered)` no longer drops the pin (which would discard the
-LLM's album/year). `_scrub_tracklist` strips the same tags from a QUOTED
-listing title before the MusicBrainz confirmation, so
-`"Bad Blood (2005 Remastered)" Ministry` scrubs to
-`Ministry - Bad Blood`.
+## Wrapper-junk engine (`_unwrap_junk` / `_group_verdict`, 2026-11-13)
+Uploading platforms wrap label junk in ANY bracket family - `(Radio Edit)`,
+`[HD]`, `{Remastered}`, `"Video"`, «Live», 『Official Music Video』,
+【320 kbps】 - so the wrapper CHARACTERS are not the rule; the group's
+CONTENT is (owner's decisions, ask form 2026-11-13):
+1. an unrecognized group survives ONLY when MusicBrainz titles one of the
+   artist's recordings exactly that way (`_mb_confirm_title`);
+2. families `( ) [ ] { } < > « » ‹ › “ ” „ " 「 」 『 』 （ ） ［ ］ 【 】`,
+   same rules everywhere; curly SINGLE quotes are deliberately NOT
+   wrappers - an apostrophe ("Don't Stop Me Now") must never read as an
+   opened group;
+3. labels strip ANYWHERE in the name, not only at the end;
+4. `feat.`/co-artist credits strip - the target is the bare song, and the
+   MusicBrainz helpers still resolve the credit-carrying recording
+   (`_rec_title_ok` below) instead of re-crediting the target;
+5. venue / dated-live groups strip too (`(Live at the Apollo)` -> gone):
+   the deliverable is the studio recording, and a live-only song carries
+   the bare title on its own tracklists anyway;
+6. only a TRAILING bare year group is the typed release year; a year group
+   anywhere else is noise the engine drops;
+7. cleaning happens BEFORE everything, the identify LLM included: `discover`
+   scrubs the tracklist form, then `_unwrap_junk`s the name ONCE, and the
+   LLM prompt, the pins, every MusicBrainz lookup, the search queries and
+   the cache key see only the cleaned name.
+Carried-over invariants: the deliverable is the original uncensored studio
+recording; `(Explicit)` stays (the explicit cut IS the deliverable); a
+group is NEVER peeled when only the label would remain - `(Live)` unwraps
+to `Live` (a band and a song title), `(Everything I Do)` unwraps to its
+content, while `Song (Live)` -> `Song`.
+
+`_groups_with_cuts` is the scanner: balanced groups per family (a closer
+matches only its own opener), nesting-aware; a group that opens ANOTHER
+family inside itself is TANGLED - its content is never verdict-dropped,
+because verdict words inside it describe the INNER structure (so
+`'"Song (Live)"'` keeps the quoted song name; the ladder peels it like any
+identity group). Unclosed openers are ignored. `_group_verdict(content)`
+judges content, family-irrelevant BY DESIGN:
+- `format`: every token a quality/format word AND ≥1 anchor (`(HD)`,
+  `(320 kbps)`, `(Official Music Video)`, `(1080p)`) - checked BEFORE the
+  rend-last rule, because 'hd' is itself a marker word;
+- `remaster`: mentions a remaster AND every token is reissue noise -
+  `(2011 Remastered)`, `(Remastered HD)`, `(30th Anniversary Remastered
+  Deluxe Edition)`, `(2011 Remaster of the Original Recording)` peel,
+  while a title genuinely carrying the word (`Song (The Remastered
+  Master)`, `Born to Remaster`) stays;
+- `rendition`: LAST token is a marker word - named remixes are open-ended,
+  the marker word is not: `(Kurayamino Mix)`, `(Hot Rod Herman Remix)`,
+  `(Boingo Alive Version)`, `(Radio Edit)`, `(24 Carat Bootleg)` drop;
+  `(Kurayamino Variation)` / `(Y2K Reload)` / `(Extended Play)` end in
+  ordinary nouns and go to the ladder instead;
+- `credit`: `feat`/`ft`/`featuring`/`duet`/`vs` first, or `with` as the
+  SECOND token - `(Duet with Phil Collins)` is a credit but
+  `(A Deal with God)` merely contains the word and stays (decision #4);
+- `venue`: carries live/concert/recorded/performance/festival/session
+  (`(Live at the Apollo)`, `(Live 1985)`); a bare `from`/`at` group with
+  no live marker is NOT venue - the ladder judges it;
+- `year`: a single 4-digit token;
+- `keep`: everything else - and `(Explicit)` is protected outright.
+`_strip_groups` drops verdict groups one at a time, rightmost first, until
+stable, so inner and newly-exposed groups get judged too; `keep` and
+TANGLED groups survive to `_mb_confirm_title`, which queries
+`recording:"TITLE" AND artist:"ARTIST"` and peels the rightmost group
+(max 5 queries) until MusicBrainz has a recording titled exactly that:
+`(Shove It)`, `(Kurayamino Variation)` and `(You Gotta) Fight for Your
+Right (To Party!)` confirm on the first query, fakes like `(Y2K Reload)`
+peel down to the bare song. MusicBrainz unreachable -> keep what the
+verdict engine left.
+`_rec_title_ok` is the exact-title test the ladder AND every MusicBrainz
+helper (studio_year / album / cd_year / duration / listing_artist /
+album-credit names) share: normalized equality, or - only for a BARE
+target - the target plus CREDIT groups, so the credit-stripped `Dark
+Horse` still resolves MusicBrainz's `Dark Horse (feat. Juicy J)` while a
+recording differing by a remaster/rendition/venue/year group is a
+DIFFERENT recording - that is what keeps the studio anchor off the 12".
+`_core_title` (the album-pluck tier-1 core) drops groups of every family,
+inert unless ≥8 normalized characters survive. The remaster-label rule of
+the previous engine (`(Remastered)`/`(2011 Remastered)`/`(Digital
+Remaster)` noise vs `(Remix)`/`(Radio Edit)` identity) survives INSIDE
+this vocabulary as the `remaster` and `rendition` verdicts; the old
+trailing-only position rule and the `(Live)`-identity exception do not
+(owner decisions #3/#5).
+Verified offline: t1 (18 typed pins), t2 (16 remaster/unwrap cases) and
+t5 (36 group verdicts - stacked labels in any order, the unwrap-when-empty
+guards, `(Alive)` / `(Extended Play)` / `(Never Live)` edge verdicts)
+0 failures in the container.
 
 ## Tracklist-form upload names (`_scrub_tracklist`, 2026-11-13)
 YouTube compilation / film-soundtrack channels name uploads like the
@@ -287,39 +357,47 @@ at the wrong song:
    limit reads as "no such recording" and silently skips the scrub.
 MB unreachable (None) still scrubs on shape alone — a better guess than the
 listing, and every MB lookup downstream is off anyway.
-The quoted text becomes the title VERBATIM except for the trailing
-technical tags `_strip_noise_tags` removes (they would break the exact MB
-confirmation just as they do for a typed name): `(Shove It)` and
-`(Kurayamino Mix)` ARE part of the MB recording and stay;
-`"Bad Blood (2005 Remastered)" Ministry` → `Ministry - Bad Blood`. The
-other normalization is whitespace (`\s+` → one space), because YouTube
-puts a nbsp inside these names (`Clubbed to Death\u00a0(Kurayamino Mix)`).
+The quoted text passes through the SAME verdict engine as a typed title:
+`(Shove It)` stays (verdict keep, and MusicBrainz-confirmed), while a
+rendition or reissue label inside the quotes strips exactly as it would
+outside them - `(Hot Rod Herman Remix)`, `(Kurayamino Mix)`,
+`(2005 Remastered)` drop - so the scrubbed name is always the
+bare-identity title MusicBrainz actually uses: `"Bad Blood (2005
+Remastered)" Ministry` -> `Ministry - Bad Blood`,
+`"Clubbed to Death (Kurayamino Mix)" Rob D` -> `Rob D - Clubbed to
+Death`. The other normalization is whitespace (`\s+` -> one space),
+because YouTube puts a nbsp inside these names (`Clubbed to Death\u00a0
+(Kurayamino Mix)`).
 
-Verified: 14 controls stay untouched (Reed Waddle `"Lonesome Dove" Live at
-… 2025`, `Queen - Don't Stop Me Now (1975)`, `(Explicit)`, `Artist - "Title"
-- 1999`, `Various - "Bad Blood"`, bracket-file names) and 2 wrong-artist
-scrubs rejected by MB (`"Lonesome Dove" Reed Waddle`, `"Bad Blood" Foo
-Fighters`); `discover` (heuristic, no LLM) on all 13 quote-bearing
-GrabbyTube names returns the real artist/title/year for 12 (`Ministry - Bad
-Blood 1999`, `The Prodigy - Mindfields 1997`, `Deftones - My Own Summer
-(Shove It) 1997`, `RoB-D - Clubbed to Death (Kurayamino Mix) 1999`, …) and
-leaves the live one as-is. Batch through GrabbyTube (the 12 Matrix tracks,
-every one `fixup` with `artist="Flix Soundtracks"` before): 8 replaced with
-verified deliveries (`Ministry - Bad Blood (1999)`, `Propellerheads -
-Spybreak! (Short One) (1998)`, `Deftones - My Own Summer (Shove It) (1997)`
-via the `Deftones-Around The Fur-1997-EOS` album pluck at AcoustID 98%,
-`Hive - Ultrasonic Sound (2003)`, `Rage Against the Machine - Wake Up
-(1992)`, `Meat Beat Manifesto - Prime Audio Soup (1998)`, `Lunatic Calm -
-Leave You Far Behind (1997)` - plus one re-run whose only earlier failure
-was an LLM 504), and 4 honest `fixup`-only results whose names are now the
-real songs: `The Prodigy - Mindfields` and `Marilyn Manson - Rock Is Dead`
-(every candidate rejected for zero AcoustID coverage), `Rob Zombie -
-Dragula (Hot Rod Herman Remix)` and `Monster Magnet - Look to Your Orb for
-the Warning (Radio Edit)` (non-studio versions, so unrecoverable by
-design). The catalog's `author`/`title` carry the scrubbed values now, so
-the library no longer shows the listing line, and the only quote-bearing
-name left in the catalog is the live Reed Waddle one the scrub correctly
-leaves alone.
+Verified offline (t4, 0 failures): 16 scrub controls stay untouched
+(Reed Waddle `"Lonesome Dove" Live at … 2025` — the venue tail fails
+condition 1, and `_requested_title`'s quoted-core rule extracts
+`Lonesome Dove` downstream; `Queen - Don't Stop Me Now (1975)`,
+`(Explicit)`, `Artist - "Title" - 1999`, `Various - "Bad Blood"`,
+bracket-file names, `Artist - "Track 5" (Remix)`) and 5 dirty names
+scrub to the canonical form, wrong-artist tails rejected by MB
+(`"Lonesome Dove" Reed Waddle`, `"Bad Blood" Foo Fighters`).
+E2E after the 2026-11-13 deploy — the three RAW polluted listings
+through `/api/tune`: `"Bad Blood" Ministry` scrubs to
+`Ministry - Bad Blood` (MB studio-year 1999 + the Matrix OST album
+tally, 300 s anchor, cache-hit studio delivery), `"My Own Summer
+(Shove It)" Deftones` scrubs with `(Shove It)` intact and delivers
+from the store, `"Mindfields" The Prodigy` scrubs to
+`The Prodigy - Mindfields (1997)` (276 s anchor) and fails honestly —
+every candidate gate-rejected (zero AcoustID coverage / 230–337 s vs
+276 s) — so the job still returns the clean artist/title and
+GrabbyTube writes the fixup. Through GrabbyTube `/tracks/tunester`
+(9 catalog tracks, names already fixup-cleaned by the earlier batch):
+6 verified deliveries — `Rob Zombie - Dragula (1998)` (the Hot Rod
+Herman Remix fixup replaced by the studio cut), `Kaskade - Raining
+(2014)`, `Ferry Corsten - Fire (2005)`, `Katy Perry - Dark Horse
+(2013)` (credit stripped), `Reed Waddle - Lonesome Dove` (the venue
+tail dropped, a verified non-live take), control `Leftfield - Open Up
+(1994)` unchanged — and 3 honest fixups with clean names
+(`Melle Fresh - Cocktail Queen`, `Oingo Boingo - Goodbye-Goodbye
+(1982)`, `Rob Dougan - Clubbed to Death (1999)`). No `Flix
+Soundtracks` string appears in any job, delivery name, or catalog
+entry.
 
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
@@ -458,7 +536,7 @@ pressing is the fallback wanted, not a generic search hit.
 
 **Parenthetical-stripped tier (2026-11-12)**: `_title_hit(name, target)`
 ranks a file name 2 = carries the target title, 1 = carries the title with
-every parenthesised segment dropped (`_core_title`, inert unless ≥8
+every bracketed segment of any family dropped (`_core_title`, inert unless ≥8
 normalized characters survive), 0 = neither. Tier 1 exists because **album
 rip track files carry the SHORT form of a song whose single/MusicBrainz
 title is long**: Licensed to Ill names track 7 `Fight for Your Right` while

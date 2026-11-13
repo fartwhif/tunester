@@ -196,78 +196,380 @@ def _requested_artist(raw: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-_TITLE_TAGS = re.compile(
-    r"\s*\((?:hd|hq|hi[\s-]?res|official\s+music\s+video|official\s+video|"
-    r"official|mv|video|full\s+song|full|1080p|720p|480p|4k|320\s*kbps|"
-    r"256\s*kbps|192\s*kbps|128\s*kbps|320|256|128|mp3|flac|wav|aac|ogg|"
-    r"m4a|stereo)\)\s*$", re.I)
-# YouTube / Spotify put the reissue's REMASTER LABEL in the title slot:
-# 'Underworld - Cowgirl (Remastered)'. A remaster is the same studio
-# recording pressed again, and MusicBrainz titles the recording without the
-# label, so a pinned 'Cowgirl (Remastered)' names no recording at all: the
-# year/album derivations and the duration anchor go empty, every search
-# query carries the label and comes back 0 hits, and the track tunes to
-# nothing (2026-11-13: 'Underworld - Cowgirl (Remastered)', 'Leftfield -
-# Open Up (Remastered)', which the discover LLM had already identified
-# correctly as 'Cowgirl' / 'Open Up'). The remaster YEAR is not the song's
-# year either: _requested_year only honors a bare '(YYYY)' group, so
-# '(2011 Remastered)' can never pin a reissue date. Contrast '(Radio Edit)'
-# and a remix, which ARE different recordings and stay in the title.
-# The group must BOTH mention a remaster and consist only of reissue
-# noise words, so '(2011 Remastered, Digital Edition)' and
-# '(Remastered HD)' peel while '(The Remastered Master)' - a title that
-# genuinely contains the word - keeps it.
-_REMASTER_NOISE = (
-    r"(?:\d+(?:st|nd|rd|th)?|remasters?|remastered|remastering|mastered"
-    r"|anniversary|edition|version|digital|expanded|deluxe|reissue(?:d)?"
-    r"|original(?:\s+recording)?|the|of|and"
-    r"|hd|hq|4k|1080p|720p|480p|kbps|bit|mp3|flac|wav|aac|ogg|m4a"
-    r"|stereo|mono)")
-_REMASTER_TAGS = re.compile(
-    r"\s*\((?=[^()]*\bremaster\w*\b)"
-    r"\s*" + _REMASTER_NOISE + r"(?:[\s,.-]+" + _REMASTER_NOISE + r")*\s*\)"
-    r"\s*$", re.I)
+# --- Wrapper-junk engine: one rule for every bracket family ----------------
+# YouTube / Spotify / archive uploaders wrap label junk in the title slot,
+# and they use ANY bracket family to do it: '(Radio Edit)', '[HD]',
+# '{Remastered}', '"Video"', «Live», 『Official Music Video』, 【320 kbps】.
+# The wrapper characters are NOT the rule (owner's decisions, 2026-11-13);
+# the group's CONTENT is: quality/format tags, remaster labels, rendition
+# markers, co-artist credits, venue/date-live groups and bare years are
+# noise and drop wherever they sit; anything else - '(Shove It)',
+# '(To Party!)', '(A Deal with God)', '(Kurayamino Variation)',
+# '(Explicit)' - is recording identity and stays unless MusicBrainz
+# (see `_mb_confirm_title`) says the artist has no recording titled that.
+# Curly single quotes are deliberately NOT wrapper characters: an
+# apostrophe inside a title ("Don't Stop Me Now", "(I've Got You)") must
+# never be read as an opened group.
+_OPEN = {"(": ")", "[": "]", "{": "}", "<": ">", "«": "»", "‹": "›",
+         "“": "”", "„": "“", "「": "」", "『": "』",
+         "（": "）", "［": "］", "【": "】"}
+_CLOSERS = {v: k for k, v in _OPEN.items()}
+_CLOSERS.setdefault("\"", "\"")
+
+
+def _groups_with_cuts(text: str) -> tuple[list[tuple[int, int, str]], str]:
+    """Balanced wrapper groups as (start, end, content) - outermost first,
+    positions into `text` - plus the text with every group's CHARACTERS
+    removed (contents keep their places). Stack scanner: a closer only
+    matches its own family's opener, and an opener of any family inside a
+    group makes that group family-tangled (its content is kept verbatim,
+    which is the safe outcome). Unclosed openers are ignored."""
+    stack: list[tuple[int, str]] = []
+    out: list[tuple[int, int, str]] = []
+    cleaned: list[str] = []
+    last = 0
+    for i, ch in enumerate(text):
+        if ch in _OPEN:
+            stack.append((i, ch))
+            cleaned.append(ch)
+        elif ch in _CLOSERS:
+            if stack and _OPEN[stack[-1][1]] == ch:
+                s, _ = stack.pop()
+                if not stack:
+                    out.append((s, i + 1, text[s + 1:i]))
+                keep = "" if stack else text[s + 1:i]
+                cleaned.append(text[last:s])
+                cleaned.append(keep)
+                last = i + 1
+            else:
+                cleaned.append(ch)
+        else:
+            cleaned.append(ch)
+    return out, "".join(cleaned)
+
+
+def _is_wrapper(text: str) -> bool:
+    """True when `text` is exactly one wrapper group, e.g. '(Everything
+    I Do)' or '«Song»'; its content is then the real title."""
+    t = text.strip()
+    return bool(t) and t[0] in _OPEN and _groups_with_cuts(t)[0] == [(0, len(t), t[1:-1])]
+
+
+# Tokens a label group may contain. A group is pure noise only when EVERY
+# token is here (or in `_QUAL_WORDS` / `_REISSUE_WORDS`); 'live' counts, so
+# '(Live 1985 Remastered)' drops. A group is never stripped when that would
+# leave nothing (see `_strip_groups`), so '(Live)' survives as the band /
+# song title it really is.
+_STRIP_WORDS = frozenset("""acoustic a an and at audio cappella cd clip clean cover covers
+duet dubs dub edit edited edits extended ft full hd hq karaoke live megamix mix mixed mixes
+nightcore parody preview remake remakes remix remixed remixes rework reworked single singles
+slowed sped speed tribute tributes unplugged vip version versions video videos""".split())
+# A group whose LAST token is here names a RENDITION whatever came before
+# it - named remixes are open-ended, the marker word is not:
+# '(Hot Rod Herman Remix)', '(Roop INPURU Dub)', '(Boingo Alive Version)',
+# '(24 Carat Bootleg)'.
+_REND_LAST = frozenset(_STRIP_WORDS | {
+    "acapella", "bootleg", "cover", "demo", "flip", "megamix", "mix",
+    "parody", "preview", "remake", "remix", "slowed", "snippet",
+    "unplugged", "vip"})
+# Reissue noise: a remaster label may mix these, but MUST mention a
+# remaster ('(2011 Remastered)', '(Remastered HD)', '(Original Recording)')
+# so '(The Remastered Master)' - a name genuinely carrying the word -
+# stays.
+_REISSUE_WORDS = frozenset(_STRIP_WORDS) | {
+    "anniversary", "deluxe", "digital", "edition", "expanded", "mastered",
+    "mono", "original", "recording", "reissue", "remaster", "remasters",
+    "remastered", "remastering", "stereo", "the", "of"}
+# Quality/format words. A group is a format tag only when every token is
+# one of these AND at least one is an anchor ('kbps', 'hd', 'video'...) -
+# so '(320 kbps)', '(Official Video)', '(1080p)' drop while '(Official)'
+# alone (nobody's noise) stays.
+_QUAL_WORDS = frozenset("""128 256 320 480p 4k 576p 720p 8k aac ac3 adts aiff alac audio
+audioflac audioonly avi bitrate bluray codec ddc divx dvd dts flac full hd hq kbps lossless
+lyric lyrics mkv mov mp3 mp4 mpeg mpeg2 mpg mv music ntsc ogg only opus official pal raw
+rem song stereo surround tv uhd vevo video videos visualizer visualizers webm webrip x264
+x265 xvid 1080p 1080i h264 h265""".split())
+_ANCHOR_WORDS = frozenset("""1080i 1080p 128 256 320 480p 4k 576p 720p 8k audio audioflac
+audioonly avi bluray dvd flac full hd hq kbps lossless lyric lyrics mkv mov mp3 mp4 mv ogg
+only song vevo video videos visualizer visualizers webm""".split())
+
+
+def _num_word(tok: str) -> bool:
+    """'2011', '320', '20th' - digits and digit-ordinals are reissue/format
+    filler, never identity by themselves ('(20th Anniversary
+    Remastered)', '(320 kbps)')."""
+    return bool(re.fullmatch(r"\d+(?:st|nd|rd|th)?", tok))
+
+
+def _group_tokens(content: str) -> list[str]:
+    return [w for w in re.split(r"[^\w']+", content.lower()) if w]
+
+
+def _group_verdict(content: str) -> str:
+    """'year' | 'format' | 'rendition' | 'credit' | 'venue' | 'remaster' |
+    'keep' for a group's CONTENT - the wrapper family is irrelevant by
+    design (owner's decision, 2026-11-13).
+
+    'keep' does NOT mean protected: it means the group may BE part of the
+    recording's real title, and `_mb_confirm_title` decides that against
+    MusicBrainz - the same MusicBrainz rule that gates the tracklist
+    scrub."""
+    toks = _group_tokens(content)
+    if not toks:
+        return "format"  # '()', '[]': literally nothing
+    if toks == ["explicit"]:
+        return "keep"  # the explicit cut IS the deliverable
+    if set(toks) & {"live", "concert", "recorded", "performance",
+                    "performances", "festival", "session", "sessions"}:
+        return "venue"  # '(Live at the Apollo)', '(Live 1985)': strip -
+        # the deliverable is the studio recording, and a live-only song
+        # carries the bare title on its own tracklists anyway (owner,
+        # 2026-11-13). A bare 'from'/'at' group without a live marker is
+        # NOT called venue - '(From the Motown Story)' goes to the
+        # MusicBrainz ladder like any other unrecognized group.
+    if (toks[0] in {"feat", "ft", "featuring", "duet", "vs"}
+            or toks[1:2] == ["with"]) \
+            and not (set(toks) <= _STRIP_WORDS | _QUAL_WORDS
+                     | _REISSUE_WORDS):
+        return "credit"  # co-artist credit: target the bare song (owner).
+        # 'with' counts ONLY as the SECOND token: '(Duet with Phil
+        # Collins)' and '(Song with X)' are credits, but '(A Deal with
+        # God)' is a title that merely contains the word and stays
+        # (owner decision #4, 2026-11-13).
+    if ({"remaster", "remasters", "remastered", "remastering", "mastered"}
+            & set(toks) and all(t in _REISSUE_WORDS or _num_word(t)
+                                for t in toks)):
+        return "remaster"  # '(2011 Remastered)', '(Remastered HD)'
+    if set(toks) <= _QUAL_WORDS and set(toks) & _ANCHOR_WORDS:
+        return "format"  # '(HD)', '(320 kbps)', '(Official Music Video)'
+        # BEFORE the rend-last rule: 'hd' is itself a marker word, so a
+        # group checked against _REND_LAST first reads as a 'mix'.
+    if toks[-1] in _REND_LAST:
+        return "rendition"  # '(Kurayamino Mix)', '(Boingo Alive Version)',
+        # '(Hot Rod Herman Remix)', '(Radio Edit)': the deliverable is the
+        # studio recording, so ANY group ending in a rendition marker drops
+        # whatever named remix before it (owner, 2026-11-13). '(Kurayamino
+        # Variation)' / '(Y2K Reload)' / '(Extended Play)' end in ordinary
+        # nouns and go to the MusicBrainz ladder instead.
+    if len(toks) == 1 and re.fullmatch(r"(?:1[92]|20)\d\d", toks[0]):
+        return "year"
+    return "keep"
+
+
+def _is_tangled(content: str) -> bool:
+    """True when a group's own content opens another group: '(Live at
+    the Apollo (2025))', '"Song (Live)"'. Verdict words inside such a
+    group describe the INNER structure, not this wrapper - judging the
+    whole content would eat a quoted song name whose quotes happen to
+    read as a group of another family. Tangled groups are never
+    verdict-dropped; `_mb_confirm_title` peels them like any identity
+    group."""
+    return any(ch in _OPEN or ch in _CLOSERS for ch in content)
+
+
+def _strip_groups(text: str) -> str:
+    """`text` with every noise group dropped, wherever it sits (owner:
+    labels drop ANYWHERE), one group at a time - rightmost first - until
+    stable, so inner and newly-exposed groups get judged too. Guards:
+      - a group that is all that is left unwraps to its CONTENT instead
+        of vanishing: 'Song (Live)' -> 'Song', '(Live)' -> 'Live' ('Live'
+        is a band and a song title), '(Everything I Do)' -> 'Everything
+        I Do', '[Song]' -> 'Song';
+      - separator junk a strip leaves behind collapses ('Song  -  ' ->
+        'Song');
+      - '(Explicit)', identity groups and TANGLED groups survive by the
+        verdict (see `_is_tangled`)."""
+    for _ in range(8):
+        if _is_wrapper(text):
+            inner = text.strip()[1:-1]
+            stripped = _strip_groups(inner)
+            return stripped if _norm(stripped) else inner.strip()
+        groups, _ = _groups_with_cuts(text)
+        drop = [(s, e, c) for s, e, c in groups
+                if _group_verdict(c) != "keep" and not _is_tangled(c)]
+        if not drop:
+            break  # what is left is recording identity
+        s, e, c = max(drop, key=lambda g: g[0])
+        rest = text[:s] + text[e:]
+        if not _norm(re.sub(r"[-\u2013\u2014:(){}\[\]<>«»“”‘’]", "", rest)):
+            inner = _strip_groups(c)  # drop would leave nothing: unwrap
+            text = inner if _norm(inner) else c.strip()
+        else:
+            text = rest
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        text = text.strip(",;\u2013\u2014- ")  # NEVER '.': 'Feel Good Inc.'
+    return re.sub(r"\s{2,}", " ", text).strip(",;\u2013\u2014- ")
+
+
+_GROUP_DROP_RE = re.compile(
+    r"\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)"
+    r"|\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+    r"|\{(?:[^{}]|\{[^{}]*\})*\}"
+    r"|«[^«»]*»|‹[^‹›]*›|“[^“”]*”|『[^『』]*』"
+    r"|（[^（）]*）|［[^［］]*］|【[^【】]*】|「[^「」]*」")
+
+
+def _drop_groups_keep_content(text: str) -> str:
+    """`text` with every balanced group removed - contents included -
+    peeled inward-out across all families (MusicBrainz-admission
+    comparison and the file-name core both need the bare stem)."""
+    prev = None
+    while text != prev:
+        prev = text
+        text = _GROUP_DROP_RE.sub(" ", text)
+    return text
+
+
+def _unwrap_junk(name: str) -> tuple[str, str]:
+    """(cleaned name, typed year) for a whole raw query or one slot of it.
+    A bare year group at the END of the name - '(1994)', '[1994]', '«1994»' -
+    is the typed release year (owner: only the TRAILING one counts; a year
+    group anywhere else is just noise and drops with the rest); label
+    groups drop from anywhere; identity groups stay, for
+    `_mb_confirm_title` to judge against MusicBrainz."""
+    year = ""
+    groups, _ = _groups_with_cuts(name)
+    if groups:
+        s, e, c = max(groups, key=lambda g: g[0])
+        toks = _group_tokens(c)
+        if (len(toks) == 1 and re.fullmatch(r"(?:1[92]|20)\d\d", toks[0])
+                and not name[e:].strip(" .,;:")):
+            year = toks[0]
+            name = name[:s] + name[e:]
+    return _strip_groups(name), year
 
 
 def _strip_noise_tags(title: str) -> str:
-    """`title` without trailing technical noise: quality/format tags
-    ('(HD)', '(320 kbps)') and a remaster label ('(Remastered)',
-    '(2011 Remastered Version)', '(20th Anniversary Remastered Edition)').
-    Stacked tags peel until stable. Recording-identity parentheticals -
-    '(Radio Edit)', '(Kurayamino Mix)', '(Shove It)' - are NOT noise."""
-    for _ in range(3):
-        cleaned = _REMASTER_TAGS.sub("", _TITLE_TAGS.sub("", title))
-        if cleaned == title:
-            break
-        title = cleaned
-    return title.strip()
+    """`title` with label junk dropped per the verdict engine (see
+    `_group_verdict`): format tags, remaster labels, renditions, credits,
+    venue/date groups and stray years - any bracket family, any position
+    (owner's decisions, 2026-11-13). Identity groups survive: they may BE
+    the recording's real title, and MusicBrainz confirms them
+    (`_mb_confirm_title`). Never strips a name down to nothing."""
+    return _strip_groups(title)
+
+
+def _all_group_contents(text: str) -> list[str]:
+    """Every wrapper group's content, outermost first, recursing inwards."""
+    out: list[str] = []
+    for _s, _e, c in _groups_with_cuts(text)[0]:
+        out.append(c)
+        out.extend(_all_group_contents(c))
+    return out
+
+
+def _rec_title_ok(rec_title: str, target: str) -> bool:
+    """Does MusicBrainz recording title `rec_title` name the target song?
+
+    Exact normalized match, OR - only when the target is BARE (credits and
+    venue groups already dropped by the verdict engine) - the target plus
+    CREDIT groups: 'Dark Horse' admits MusicBrainz's 'Dark Horse
+    (feat. Juicy J)', because the co-artist credit is noise the owner wants
+    dropped from the target while MusicBrainz titles the recording WITH it.
+    A rec that differs from a bare target by a REMASTER / RENDITION / VENUE
+    / YEAR group is a DIFFERENT recording (the 12", the remix, the live
+    take) and is rejected - that is what keeps the studio anchor off the
+    remix. When the target itself carries identity groups (kept by
+    `_mb_confirm_title` because MusicBrainz titles the recording that way)
+    only the exact match is allowed."""
+    tn, rn = _norm(target), _norm(rec_title)
+    if rn == tn:
+        return True
+    if _groups_with_cuts(target)[0]:
+        return False  # target keeps identity groups -> exact only
+    if not tn:
+        return False
+    if _norm(_drop_groups_keep_content(rec_title)) != tn:
+        return False  # a different song under the parentheticals
+    return all(_group_verdict(c) == "credit"
+               for c in _all_group_contents(rec_title))
+
+
+def _mb_confirm_title(artist: str, title: str, log=print) -> str:
+    """`title` trimmed until MusicBrainz has a recording that this artist
+    titles exactly that way (owner's rule: a group our vocabulary did not
+    recognize survives ONLY if MusicBrainz confirms it names the
+    recording).
+
+    The verdict engine already dropped every recognizable label; what is
+    left in brackets is either a real recording title - '(Shove It)',
+    '(Kurayamino Variation)', '(To Party!)', '(Everything I Do)' - or a
+    fake our vocabulary missed - '(Y2K Reload)', '(Tall Paul Bootleg)'.
+    Ask MusicBrainz: exact-titled recording for this artist -> keep; none
+    -> peel the rightmost group and ask again (a fake peels down to the
+    bare song the studio recording IS titled). Stops at the bare stem, on
+    the first confirmed form, and when MusicBrainz never answers (keep
+    what the verdict engine left)."""
+    t = title.strip()
+    for _ in range(5):
+        groups = _groups_with_cuts(t)[0]
+        if not groups:
+            return t  # bare stem: nothing to confirm, nothing to peel
+        q = urllib.parse.urlencode({
+            "query": f'recording:"{t}" AND artist:"{artist}"',
+            "fmt": "json", "limit": 25})
+        data = _mb_get(f"/recording?{q}", log)
+        if data is None:
+            return t  # MusicBrainz unreachable: trust the verdict engine
+        if any(_rec_title_ok(str(r.get("title") or ""), t)
+               for r in data.get("recordings", [])):
+            return t
+        s, e, c = max(groups, key=lambda g: g[0])
+        rest = t[:s] + t[e:]
+        if not _norm(_drop_groups_keep_content(rest)):
+            return t  # peeling would leave no song name
+        log(f"      MusicBrainz has no recording titled {t!r} for "
+            f"{artist!r}; dropping unrecognized group {c!r}")
+        t = _strip_groups(rest)
+    return t
+
+
+# Double quotes only: an apostrophe must NEVER close a quoted title, or
+# 'Queen - Don't Stop Me Now' would read as a quoted title plus a tail.
+_QUOTE = "[\"\u201c\u201d\u201e\u201f]"
+_QUOTED = re.compile(_QUOTE + r"(?=\s*\S)(.+?)" + _QUOTE, re.S)
 
 
 def _requested_title(raw: str) -> str:
     """The title the user explicitly typed in 'Artist - Title' form,
-    cleaned of a repeated artist prefix ("Gorillaz - Gorillaz - Feel Up"),
-    a trailing year, and technical tags like '(HD)' or '(Remastered)'. ''
-    for free-form descriptions (where the LLM picks the title)."""
+    cleaned by the verdict engine (any bracket family, any position), of
+    a repeated artist prefix ("Gorillaz - Gorillaz - Feel Up"), and of a
+    bare trailing year group. A LISTING-style title whose song sits in
+    quotes ('"Bad Blood" Ministry', '"Lonesome Dove" Live at ... 2025')
+    yields the QUOTED CORE plus any GROUPS sitting right behind the
+    quote: what trails the quote is either an artist credit - in which
+    case `_scrub_tracklist` already rewrote the whole name and this never
+    sees it - or unbracketed venue/date noise no group rule can see (the
+    quoted text IS the song either way), while a bracketed tail
+    ('"Guaranteed" (From Into the Wild)') is an identity candidate the
+    MusicBrainz ladder must still judge, so it stays. '' for free-form
+    descriptions (where the LLM picks the title)."""
     m = re.match(r"^\s*(?:the\s+)?(.+?)\s+[-\u2013\u2014:]\s+(.+?)\s*$", raw.strip())
     if not m:
         return ""
     artist, title = m.group(1).strip(), m.group(2).strip()
-    # A trailing "(1994)" is the year, not part of the title (the LLM
-    # never includes it in its answer).
-    title = re.sub(r"\s*\((1[9]\d{2}|20\d{2})\)\s*$", "", title)
+    title = _strip_noise_tags(title)
     if artist:
         title = re.sub(rf"^{re.escape(artist)}\s+[-\u2013\u2014:]\s*",
                        "", title, flags=re.I)
-    return _strip_noise_tags(title)
+        title = _strip_noise_tags(title)
+    q = _QUOTED.match(title)
+    if q:
+        core = re.sub(r"\s+", " ", q.group(1)).strip().strip(",;:\u2013\u2014- ")
+        tail = title[q.end():]
+        groups = "".join(tail[s:e] for s, e, _c in _groups_with_cuts(tail)[0])
+        title = f"{core} {groups}".strip() if groups else core
+        title = _strip_noise_tags(title)
+    return title
 
 
 def _requested_year(raw: str) -> str:
-    """The release year the user typed in 'Artist - Title (YYYY)', or ''.
-    The trailing '(YYYY)' is the year, not part of the title (the same
-    token _requested_title strips); a year in a free-form description
-    has no such trailing group, so the LLM's year still applies there."""
-    m = re.search(r"\((1[9]\d{2}|20\d{2})\)\s*$", raw.strip())
-    return m.group(1) if m else ""
+    """The release year the user typed as a bare trailing year group -
+    '(1994)', '[1994]', '«1994»' - or ''. Only the TRAILING group counts
+    (owner's rule); a year group anywhere else is noise the verdict
+    engine already drops, and a year written inside free-form text has
+    no wrapper group, so the LLM's year still applies there."""
+    return _unwrap_junk(raw)[1]
 
 
 
@@ -283,10 +585,6 @@ def _requested_year(raw: str) -> str:
 # whole chain (pins, MusicBrainz lookups, gates, cache keys) at once.
 _TRACKLIST_TAG = re.compile(
     r"(?i)\b(?:track|cut|song|disc|cd|part|side)\s*(?:no\.?|num\.?|#)?\s*\d+\b")
-# Double quotes only: an apostrophe must NEVER close a quoted title, or
-# 'Queen - Don't Stop Me Now' would read as a quoted title plus a tail.
-_QUOTE = "[\"\u201c\u201d\u201e\u201f]"
-_QUOTED = re.compile(_QUOTE + r"(?=\s*\S)(.+?)" + _QUOTE, re.S)
 # A tail that is really a venue/date/credit is not an artist name:
 # 'Live at the Dripping Springs Songwriter Festival 2025', '(Explicit)',
 # 'feat. X'. A 4-digit year anywhere in the tail is a date, never part of a
@@ -338,7 +636,7 @@ def musicbrainz_listing_artist(title: str, tail: str,
         return ""
     loose = ""
     for r in data.get("recordings", []):
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         for cred in r.get("artist-credit", []):
             name = str(cred.get("name") or "").strip()
@@ -385,11 +683,11 @@ def _scrub_tracklist(raw: str, log=print) -> str:
     if not _tail_is_artist_name(tail):
         return ""
     # A remaster label INSIDE the quotes is the same reissue noise as a
-    # typed one (see `_REMASTER_TAGS`): the listing copied it from the
+    # typed one (verdict 'remaster'): the listing copied it from the
     # reissue, MusicBrainz titles the recording without it, so the
     # confirmation and the scrubbed name both use the stripped form -
     # '"Bad Blood (2005 Remastered)" Ministry' scrubs to 'Ministry - Bad
-    # Blood'. Identity parentheticals survive the strip untouched.
+    # Blood'. Identity groups survive the strip untouched.
     title = _strip_noise_tags(title)
     artist = musicbrainz_listing_artist(title, tail, log)
     if artist is None:
@@ -438,17 +736,19 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
     if scrubbed:
         log(f"      tracklist name {raw!r} -> {scrubbed!r}")
         raw = scrubbed
-    raw = raw.strip()
-    # Computed from the (possibly scrubbed) raw before the heuristic branch
-    # below strips a typed "(YYYY)" out of raw.
-    req_year = _requested_year(raw)
+    # Wrapper junk - label groups of any bracket family anywhere in the
+    # name, plus a bare trailing year group as the typed year - comes out
+    # of the name here, ONCE, before the LLM, the pins, the MusicBrainz
+    # lookups, the search queries and the cache key ever see it (owner's
+    # decision: clean before everything, identification included).
+    raw, req_year = _unwrap_junk(raw)
     cd_year = ""
     if use_llm:
         d = llm.chat_json(DISCOVER_SYSTEM, raw)
         artist = str(d.get("artist") or "").strip()
         # A remaster label is noise wherever it came from - the LLM echoes
         # '(Remastered)' from the input just as happily as YouTube writes it
-        # (see `_REMASTER_TAGS`), and a title carrying it names no
+        # (verdict 'remaster'), and a title carrying it names no
         # MusicBrainz recording.
         title = _strip_noise_tags(str(d.get("title") or ""))
         year = _clean_year(str(d.get("year") or ""))
@@ -492,18 +792,23 @@ def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
         if req_year:
             year = req_year
     else:
-        # heuristic fallback: "Artist - Title (YYYY)"
-        year = ""
-        m = re.search(r"\((1[9]\d{2}|20\d{2})\)", raw)
-        if m:
-            year = m.group(1)
-            raw = raw[: m.start()] + raw[m.end():]
-        m = re.match(r"^\s*(?:the\s+)?(.+?)\s+[-\u2013\u2014:]\s+(.+?)\s*$", raw.strip())
-        if not m:
+        # heuristic fallback: the SAME parsers the LLM branch pins with, on
+        # the already-unwrapped name (a trailing year group was captured
+        # into req_year above, so nothing is left here to strip).
+        artist = _requested_artist(raw)
+        title = _requested_title(raw)
+        if not artist or not title:
             raise TuneError("cannot parse 'Artist - Title' without the LLM; "
                             "rerun without --no-llm")
-        artist, title = m.group(1).strip(), _strip_noise_tags(m.group(2))
+        year = req_year
         album = ""
+    # A bracket group the verdict engine did not recognize survives only
+    # when MusicBrainz titles one of this artist's recordings exactly that
+    # way (owner's rule); otherwise peel down to the confirmed song. Runs
+    # BEFORE the year/album/duration lookups so they all query the final
+    # title.
+    if title:
+        title = _mb_confirm_title(artist, title, log)
     # Without a typed year the only year driving musicbrainz_album's
     # +/-1 window and musicbrainz_duration's cluster is the discover LLM's
     # guess - nondeterministic (the same pinned "Oingo Boingo - Just
@@ -652,7 +957,7 @@ def musicbrainz_studio_year(artist: str, title: str,
     a, t = _norm(artist), _norm(title)
     best = 0
     for r in data.get("recordings", []):
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "")
                             for x in r.get("artist-credit", [])))
@@ -715,7 +1020,7 @@ def musicbrainz_duration(artist: str, title: str, year: str,
         data = _mb_get(f"/recording?{q}", log)
         lens: list[int] = []
         for r in (data or {}).get("recordings", []):
-            if _norm(str(r.get("title") or "")) != t:
+            if not _rec_title_ok(str(r.get("title") or ""), title):
                 continue
             ac = _norm(" ".join(x.get("name", "")
                                 for x in r.get("artist-credit", [])))
@@ -731,7 +1036,7 @@ def musicbrainz_duration(artist: str, title: str, year: str,
                     continue
                 for media in rel.get("media") or []:
                     for tr in media.get("track") or []:
-                        if _norm(str(tr.get("title") or "")) == t and tr.get("length"):
+                        if _rec_title_ok(str(tr.get("title") or ""), title) and tr.get("length"):
                             try:
                                 lens.append(int(tr["length"]) // 1000)
                             except (TypeError, ValueError):
@@ -756,7 +1061,7 @@ def musicbrainz_duration(artist: str, title: str, year: str,
             continue
         if length <= 30:
             continue
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "") for x in r.get("artist-credit", [])))
         if not (a in ac or ac in a):
@@ -813,7 +1118,7 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
     counts: dict[str, int] = {}    # norm title -> pressing count
     window: dict[str, int] = {}    # norm title -> pressings within year +/-1
     for r in data.get("recordings", []):
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "") for x in r.get("artist-credit", [])))
         if not (a in ac or ac in a):
@@ -863,7 +1168,7 @@ def musicbrainz_cd_year(artist: str, title: str, log=print) -> str:
     a, t = _norm(artist), _norm(title)
     official, other = "", ""
     for r in data.get("recordings", []):
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "")
                             for x in r.get("artist-credit", [])))
@@ -1601,11 +1906,10 @@ def _nzb_manifest(cand: Candidate, log) -> bytes | None:
     return manifest
 
 
-_PAREN_RE = re.compile(r"\([^()]*\)")
-
 
 def _core_title(title: str) -> str:
-    """Song title with every parenthesised segment dropped, normalized.
+    """Song title with every bracketed segment (any family) dropped,
+    normalized.
 
     Album rip track files carry the SHORT form of a song whose single/
     MusicBrainz title is long: the Licensed to Ill CD rips name the track
@@ -1622,9 +1926,9 @@ def _core_title(title: str) -> str:
     """
     prev = None
     t = title
-    while t != prev:  # "(a (b) c)": strip innermost group outward
+    while t != prev:  # '(a (b) c)': drop innermost group outward
         prev = t
-        t = _PAREN_RE.sub(" ", t)
+        t = _drop_groups_keep_content(t)
     core = _norm(t)
     return core if len(core) >= 8 else ""
 
@@ -1717,7 +2021,7 @@ def _album_credit_names(target: Target, log) -> list[str]:
     display: dict[str, str] = {}
     counts: dict[str, int] = {}
     for r in data.get("recordings", []):
-        if _norm(str(r.get("title") or "")) != t:
+        if not _rec_title_ok(str(r.get("title") or ""), target.title):
             continue
         ac = _norm(" ".join(x.get("name", "")
                             for x in r.get("artist-credit", [])))
