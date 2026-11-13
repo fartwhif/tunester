@@ -14,9 +14,10 @@ entry (`_cache_write`):
   archive.org/SoundCloud, where `name=""`). Skips the fetch; the hydrated
   copy is ffprobe-checked and then runs the FULL gate + transcode again, so
   the cache never changes what gets delivered. `_cache_release_hit` covers
-  whole-RAR plucks: it scans sidecars for this release URL + a name
-  containing the target title (the same file the pluck would have picked),
-  so a different track from the same release is a miss.
+  whole-RAR plucks: it scans sidecars for this release URL + a name naming
+  the target title at the same `_title_hit` tier the pluck would have used
+  (see "Parenthetical-stripped tier" under Album pluck), so a different
+  track from the same release is a miss.
 - `deliveries/` — key `sha1(_norm(artist), _norm(title))`, i.e. the song
   identity the gates verified. **The tag year is NOT in the key**: which year
   a pre-CD song first hit CD is fuzzy and `discover` does not answer it the
@@ -340,11 +341,36 @@ Release names are untrustworthy — selection is by **per-file** names:
 `discover` returns the original album and the MusicBrainz duration
 anchor. The `artist + album + year` nzb search runs for every nzb target:
 candidates are ranked (album in title, year in title, then oldest first)
-and up to 10 are
-NZB-checked (cache-first `_nzb_manifest`); the first release whose file
-list contains a clean file with the song title becomes the pluck
-candidate and is **tried before** direct search hits — the original
-album is the canonical source. Direct hits remain the fallback.
+and up to 10 are NZB-checked (cache-first `_nzb_manifest`); EVERY release whose file list
+contains a clean file naming the song becomes a pluck candidate, best
+first, and each is tried until one survives the duration/AcoustID/LLM
+gates — **before** direct search hits (the original album is the canonical
+source; direct hits remain the fallback). Returning only the first manifest
+match was wrong: a release can pass the name check and still die at the
+download stage (archive over the size cap, bad rip), and the next album
+pressing is the fallback wanted, not a generic search hit.
+
+**Parenthetical-stripped tier (2026-11-12)**: `_title_hit(name, target)`
+ranks a file name 2 = carries the target title, 1 = carries the title with
+every parenthesised segment dropped (`_core_title`, inert unless ≥8
+normalized characters survive), 0 = neither. Tier 1 exists because **album
+rip track files carry the SHORT form of a song whose single/MusicBrainz
+title is long**: Licensed to Ill names track 7 `Fight for Your Right` while
+the single and MB recording 026c26a7 carry `(You Gotta) Fight for Your
+Right (To Party!)`, so no containment test preserving the parentheticals
+can ever match — the pluck checked 10 releases (including three
+per-file CD rips: `07-beastie_boys-fight_for_your_right-rec.mp3`,
+`07 - Fight For Your Right.flac`) and reported "no release contained the
+track", while the whole direct-search fallback had only a 182 s non-studio
+candidate. Tiers, not one loosened test, so a full-title file always
+outranks a stripped-name file in the same release (a 12" named after its
+A-side is still never plucked for the B-side); `_nzb_album_file`, the
+bare-file and archive pluck rankings, and the release-level cache lookup
+`_cache_release_hit` all use the same tiers so pluck and cache agree.
+Delivery: the 24-bit/96 kHz 2014 PBTHAL vinyl FLAC (`07 - Fight For Your
+Right.flac`, 212 s) → AcoustID 100% `Beastie Boys - (You Gotta) Fight for
+Your Right (To Party)` → LLM studio → 211.8 s 160k delivery replacing the
+fake in library `eBShN8qT4lk`.
 
 **Co-artist albums (2026-11-12)**: the album is also searched under the
 artists MusicBrainz credits its pressings to (`_album_credit_names`, top 2

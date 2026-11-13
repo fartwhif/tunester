@@ -819,13 +819,21 @@ def _cache_release_hit(url: str, target: Target, tmp: Path,
                        log) -> tuple[Path, str] | None:
     """Cache hit for a whole-release pluck, where the plucked file's name is
     not yet known: scan the cache for a source recorded from this release URL
-    whose name contains the target title - exactly the file the pluck would
-    have selected. A different song from the same release is a miss."""
+    whose name names the target title at the SAME tier the pluck would have
+    used (see `_title_hit`) - exactly the file the pluck would have
+    selected. A different song from the same release is a miss."""
     d = _cache_dir("sources", log)
     if d is None:
         return None
-    want = _norm(target.title)
-    best: tuple[tuple[int, int], dict, Path] | None = None
+    # The SAME title-hit tiers the pluck ranks on: the cached file is
+    # whatever this release's pluck would have selected, so a release whose
+    # audio files carry the parenthetical-stripped title (`07 - Fight For
+    # Your Right.flac`) must hit here too, not only exact-title names.
+    def _rank_of(name: str, size: int, ext: str):
+        fmt = {"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
+               "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0)
+        return (_title_hit(name, target), fmt, size)
+    best: tuple[tuple[int, int, int], dict, Path] | None = None
     try:
         metas = list(d.glob("*.json"))
     except OSError:
@@ -837,12 +845,10 @@ def _cache_release_hit(url: str, target: Target, tmp: Path,
             continue
         blob, meta = rec
         name = str(meta.get("name") or "")
-        if meta.get("url") != url or not want or want not in _norm(name):
+        if meta.get("url") != url or not _title_hit(name, target):
             continue
         ext = str(meta.get("ext") or "")
-        rank = ({"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
-                 "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0),
-                blob.stat().st_size)
+        rank = _rank_of(name, blob.stat().st_size, ext)
         if best is None or rank > best[0]:
             best = (rank, meta, blob)
     if best is None:
@@ -1415,15 +1421,70 @@ def _nzb_manifest(cand: Candidate, log) -> bytes | None:
     return manifest
 
 
+_PAREN_RE = re.compile(r"\([^()]*\)")
+
+
+def _core_title(title: str) -> str:
+    """Song title with every parenthesised segment dropped, normalized.
+
+    Album rip track files carry the SHORT form of a song whose single/
+    MusicBrainz title is long: the Licensed to Ill CD rips name the track
+    `07 - Fight For Your Right.flac` and
+    `07-beastie_boys-fight_for_your_right-rec.mp3`, while MusicBrainz and
+    the single carry `(You Gotta) Fight for Your Right (To Party!)` - the
+    parentheticals are dropped by the person who named the files, so no
+    containment test that preserves them can ever match (2026-11-12: all
+    10 Licensed to Ill releases, including three per-file CD rips, looked
+    like they did not contain the song). Used only BELOW the exact-title
+    tier, and only when at least 8 normalized characters survive: a
+    3-word parenthetical tagline ("(I Need) You") is too loose to name a
+    track.
+    """
+    prev = None
+    t = title
+    while t != prev:  # "(a (b) c)": strip innermost group outward
+        prev = t
+        t = _PAREN_RE.sub(" ", t)
+    core = _norm(t)
+    return core if len(core) >= 8 else ""
+
+
+def _title_hit(name: str, target: Target) -> int:
+    """How strongly a file name names the target song: 2 = the exact
+    title, 1 = the parenthetical-stripped title, 0 = neither.
+
+    Tiers rather than one loosened test, because loosening must never
+    steal a real match: when a release lists a file carrying the full
+    title, that file ranks above every stripped-name file in the same
+    release (the 12" named after its A-side is still never plucked for a
+    B-side). 0 means "this file does not name the song" - an album check
+    never plucks one, so a whole-album release whose listing has no
+    matching name is still no candidate.
+    """
+    n = _norm(name)
+    want = _norm(target.title)
+    if want and want in n:
+        return 2
+    core = _core_title(target.title)
+    if core and core != want and core in n:
+        return 1
+    return 0
+
+
 def _nzb_album_file(manifest: bytes, target: Target,
-                    bad) -> str | None:
-    """Name of a media file in the release whose name contains the song
-    title (album pluck check), or None. Files flagged censored/altered
-    (remix packs etc.) are ignored."""
+                    bad) -> tuple[str, int] | None:
+    """(name, hit tier) of the media file the pluck would select from this
+    release - the same (title-hit, format, size) ranking `_download_nzb`
+    applies to its own file list - or None when no file names the song
+    (album pluck check). Files flagged censored/altered (remix packs etc.)
+    are ignored. Tier 2 = the exact title, tier 1 = the parenthetical-
+    stripped title - the form album rip track files actually use, see
+    `_core_title`."""
     try:
         root = ET.fromstring(manifest)
     except ET.ParseError:
         return None
+    best: tuple[tuple[int, int, int], str] | None = None
     for fe in root.findall(f"{NZB_NS}file"):
         subj = fe.get("subject") or fe.findtext(f"{NZB_NS}subject") or ""
         name = _nzb_file_name(subj)
@@ -1432,9 +1493,19 @@ def _nzb_album_file(manifest: bytes, target: Target,
             continue
         if bad(name):
             continue
-        if _norm(target.title) and _norm(target.title) in _norm(name):
-            return name
-    return None
+        tier = _title_hit(name, target)
+        if not tier:
+            continue
+        fmt = {"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
+               "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0)
+        size = sum(int(se.get("bytes", 0))
+                   for se in fe.findall(f"{NZB_NS}segments/{NZB_NS}segment"))
+        rank = (tier, fmt, size)
+        if best is None or rank > best[0]:
+            best = (rank, name)
+    if best is None:
+        return None
+    return best[1], best[0][0]
 
 
 def _album_credit_names(target: Target, log) -> list[str]:
@@ -1491,11 +1562,20 @@ def _album_credit_names(target: Target, log) -> list[str]:
 def _nzb_album_cands(target: Target, seen: set[str],
                      log) -> list[Candidate]:
     """Extra nzb search by original album name + target year (so the
-    original pressing outranks reissues); the first release whose NZB
-    lists a clean media file matching the song title is returned (the
-    track is then plucked at download). Up to 10 releases are NZB-checked
-    (cached manifests are free); bad-curation false fronts - e.g. 2014
-    reissues titled "(2001)" - can occupy the top ranks.
+    original pressing outranks reissues); EVERY release whose NZB lists a
+    clean media file naming the song is returned, best first (see the
+    ordering below), and each is tried at download until one survives the
+    duration/AcoustID gates. Returning only the first manifest match was
+    wrong: a release can pass a name check and still fail the gates (a bad
+    rip, an archive over the size cap), and the next album pressing is
+    exactly the fallback wanted - not the non-album search hits. Up to 10
+    releases are NZB-checked (cached manifests are free); bad-curation
+    false fronts - e.g. 2014 reissues titled "(2001)" - can occupy the
+    top ranks.
+
+    Order: the strongest file-name hit in the release (full title before
+    the parenthetical-stripped form, `_title_hit`), then lossless/audio
+    format cues in the release title, then the target year, then newest.
 
     The album is searched under the target artist AND under the artists
     MusicBrainz credits its pressings to (`_album_credit_names`): scene
@@ -1533,6 +1613,7 @@ def _nzb_album_cands(target: Target, seen: set[str],
                 -c.posted)
     cands = sorted(cands, key=_rank, reverse=True)
     checked = 0
+    hits: list[tuple[int, Candidate]] = []
     for c in cands:
         if checked >= 10:
             break
@@ -1545,11 +1626,21 @@ def _nzb_album_cands(target: Target, seen: set[str],
         checked += 1
         if manifest is None:
             continue
-        if _nzb_album_file(manifest, target, bad):
-            log(f"      album pluck: song found in {c.title!r}")
-            return [c]
-    log("      album pluck: no release contained the track")
-    return []
+        found = _nzb_album_file(manifest, target, bad)
+        if found:
+            name, tier = found
+            log(f"      album pluck: {name!r} found in {c.title!r}")
+            hits.append((tier, c))
+    if not hits:
+        log("      album pluck: no release contained the track")
+        return []
+    # Best-first: `tune` tries these in order and moves to the next one
+    # when a release dies at the download/verify stage, so a rip that
+    # fails the gates yields to the next album pressing rather than to a
+    # generic search hit. `_rank`'s last key is -posted: descending that
+    # is the OLDEST release first - the original pressing.
+    return [c for _hit, c in sorted(hits, key=lambda h: (h[0], _rank(h[1])),
+                                    reverse=True)]
 
 
 def _download_nzb(cand: Candidate, tmp: Path, target: Target,
@@ -1595,7 +1686,7 @@ def _download_nzb(cand: Candidate, tmp: Path, target: Target,
         if bad(name):
             continue
         size = sum(b for _, b in segs)
-        hit = 1 if _norm(target.title) and _norm(target.title) in _norm(name) else 0
+        hit = _title_hit(name, target)
         fmt = {"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
                "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0)
         ranked.append((hit, fmt, size, item))
@@ -1775,8 +1866,7 @@ def _nzb_archive_pluck(files, url: str, tmp: Path, target: Target,
         ext = p.suffix.lower().lstrip(".")
         fmt = {"flac": 3, "wav": 2, "aiff": 2, "aif": 2,
                "mp3": 1, "ogg": 1, "m4a": 1}.get(ext, 0)
-        hit = (1 if _norm(target.title) and _norm(target.title)
-               in _norm(p.name) else 0)
+        hit = _title_hit(p.name, target)
         ranked.append((hit, fmt, p.stat().st_size, p))
     if not ranked:
         log("        no usable audio file in archive (censored/altered only)")
