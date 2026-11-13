@@ -215,6 +215,62 @@ track: an honest "all sources exhausted" instead of a different song's
 file. The DISCOVER_SYSTEM prompt also forbids both substitutions (soft);
 the pins are the hard guarantee (LLM output is nondeterministic).
 
+## Tracklist-form upload names (`_scrub_tracklist`, 2026-11-13)
+YouTube compilation / film-soundtrack channels name uploads like the
+LISTING they came from: the channel takes the artist slot and the real song
+sits in quotes with the real artist right behind it —
+`Flix Soundtracks - The Matrix Soundtrack Track 9. "My Own Summer (Shove
+It)" Deftones`. Naive `Artist - Title` parsing reads `Flix Soundtracks` as
+the artist and the whole listing line as the title, and because `discover`
+PINS whatever the user typed (see above) that junk propagates into the
+DISCOVER prompt, the pins, the MB lookups, the search queries and every
+gate — all 12 remaining Matrix tracks tuned to nothing with
+`artist="Flix Soundtracks"`. Fix: scrub the name to the canonical
+`Artist - Title` at the TOP of `discover`, before any parsing, so the whole
+chain works on the real song (and the fixup GrabbyTube writes back is the
+clean name too).
+
+Three conditions must hold, because a false scrub retargets the whole run
+at the wrong song:
+1. a quoted title with a plausible artist credit IMMEDIATELY behind it
+   (`_QUOTE` = double quotes only — an apostrophe must never close the
+   title, or `Queen - Don't Stop Me Now` would parse; the tail must pass
+   `_ARTIST_SHAPE` and carry no `live at`/`feat.`/`official`/`video`/`cover`
+   /`explicit`/… marker and no 4-digit year, so the user's own `(1994)` tag,
+   `(Explicit)` and `Live at the … Festival 2025` all fail it);
+2. the name identifies itself as a listing — a `Track 3.`/`Disc 2:`/`Side
+   A`/`Part 1` marker, or a label ending in `-`/`:` before the quote (how a
+   channel fronts its own name);
+3. MusicBrainz confirms that artist for that EXACT title
+   (`musicbrainz_listing_artist`, matching per artist-credit NAME so a
+   duet/featured credit still resolves, and a short tail resolves to the
+   canonical spelling: the Matrix listing's `Rob D` is MB's `RoB-D`, the
+   name every rip is filed under). An unconfirmed tail is not an artist
+   credit → no scrub. **`limit=100` is REQUIRED**: `Rock Is Dead` has 100+
+   MB recordings and Marilyn Manson's are not in the first 25, so a small
+   limit reads as "no such recording" and silently skips the scrub.
+MB unreachable (None) still scrubs on shape alone — a better guess than the
+listing, and every MB lookup downstream is off anyway.
+The quoted text is kept VERBATIM as the title, parentheticals included:
+`(Shove It)` and `(Kurayamino Mix)` ARE part of the MB recording
+(`_requested_title`'s technical-tag strip still runs afterwards). The only
+normalization is whitespace (`\s+` → one space), because YouTube puts a
+nbsp inside these names (`Clubbed to Death\u00a0(Kurayamino Mix)`).
+
+Verified: 14 controls stay untouched (Reed Waddle `"Lonesome Dove" Live at
+… 2025`, `Queen - Don't Stop Me Now (1975)`, `(Explicit)`, `Artist - "Title"
+- 1999`, `Various - "Bad Blood"`, bracket-file names) and 2 wrong-artist
+scrubs rejected by MB (`"Lonesome Dove" Reed Waddle`, `"Bad Blood" Foo
+Fighters`); `discover` (heuristic, no LLM) on all 13 quote-bearing
+GrabbyTube names returns the real artist/title/year for 12 (`Ministry - Bad
+Blood 1999`, `The Prodigy - Mindfields 1997`, `Deftones - My Own Summer
+(Shove It) 1997`, `RoB-D - Clubbed to Death (Kurayamino Mix) 1999`, …) and
+leaves the live one as-is. End to end: the Matrix Track 9 name delivered
+`Deftones - My Own Summer (Shove It) (1997).mp3` in 69 s via the
+`Deftones-Around The Fur-1997-EOS` album pluck, AcoustID 98% studio match —
+the first time that file was reachable at all, because the target artist
+used to be `Flix Soundtracks`.
+
 ## QC gates (`verify_download`)
 probe (ffprobe: decodable, ≥20 s, not truncated) → **duration anchor** →
 **AcoustID content gate** (optional) → **LIVE-version gate** → LLM version

@@ -235,6 +235,129 @@ def _requested_year(raw: str) -> str:
     return m.group(1) if m else ""
 
 
+
+# --- Tracklist-form upload names (YouTube compilations / film soundtracks) ---
+# Such uploads name themselves like the LISTING they were taken from, not
+# like a song: the uploader's channel takes the artist slot and the real
+# song sits in quotes with the real artist right behind it. Naive 'Artist -
+# Title' parsing therefore hands discovery 'Flix Soundtracks' as the artist
+# and 'The Matrix Soundtrack Track 9. "My Own Summer (Shove It)" Deftones'
+# as the title - and because discover PINS whatever the user typed, that
+# junk propagates through the LLM, the nzb/archive queries and every gate.
+# Scrubbing to the canonical 'Artist - Title' BEFORE any parsing fixes the
+# whole chain (pins, MusicBrainz lookups, gates, cache keys) at once.
+_TRACKLIST_TAG = re.compile(
+    r"(?i)\b(?:track|cut|song|disc|cd|part|side)\s*(?:no\.?|num\.?|#)?\s*\d+\b")
+# Double quotes only: an apostrophe must NEVER close a quoted title, or
+# 'Queen - Don't Stop Me Now' would read as a quoted title plus a tail.
+_QUOTE = "[\"\u201c\u201d\u201e\u201f]"
+_QUOTED = re.compile(_QUOTE + r"(?=\s*\S)(.+?)" + _QUOTE, re.S)
+# A tail that is really a venue/date/credit is not an artist name:
+# 'Live at the Dripping Springs Songwriter Festival 2025', '(Explicit)',
+# 'feat. X'. A 4-digit year anywhere in the tail is a date, never part of a
+# name - the quoted-title form carries no typed '(YYYY)' for _requested_year
+# to trust. 'live' disqualifies only when it introduces a recording ('live
+# at'/'live from'); a bare 'Live' IS an artist (the band), mirroring the
+# make_bad_filter artist-word exemption.
+_TAIL_NOT_ARTIST = re.compile(
+    r"(?i)\blive (?:at|from|with)\b|\bfeat\.?\b|\bfeaturing\b|\bwith\b"
+    r"|\bvarious\b|\bofficial\b|\b(?:video|mv|audio|lyrics?)\b"
+    r"|\b(?:cover|remix|remaster|edit|version|explicit|instrumental)\b"
+    r"|1[9]\d{2}|20\d{2}")
+# Letters first, then the punctuation an artist name actually uses. This
+# alone rejects '(1975)', '(Explicit)', '"Short One" X' and empty tails.
+_ARTIST_SHAPE = re.compile(r"^[^\W\d_][\w .&'\u2019\u2013\-]*$")
+
+
+def _tail_is_artist_name(tail: str) -> bool:
+    """Could the text directly after a quoted title be one artist credit?"""
+    if not tail or len(tail) > 40 or len(tail.split()) > 5:
+        return False
+    return not _TAIL_NOT_ARTIST.search(tail) and bool(_ARTIST_SHAPE.match(tail))
+
+
+def musicbrainz_listing_artist(title: str, tail: str,
+                               log=print) -> str | None:
+    """Canonical MusicBrainz artist credit for `title` among the recordings
+    credited to someone matching `tail`; '' when MusicBrainz knows no such
+    recording, None when MusicBrainz never answered.
+
+    The corroboration is what makes the scrub safe: the tail is only trusted
+    as an artist when MusicBrainz credits an artist matching it for THAT
+    exact title. Matching is per artist-credit NAME (not the joined credit),
+    so a duet or featured track still resolves, and a short/misspelled tail
+    resolves to the canonical spelling - the Matrix listing's 'Rob D' is
+    MusicBrainz's 'RoB-D', the name every source names the rip by.
+    limit 100 is required: 'Rock Is Dead' has 100+ MusicBrainz recordings
+    and Marilyn Manson's are not in the first 25, so a small limit reads as
+    'no such recording' and silently skips the scrub.
+    """
+    q = urllib.parse.urlencode({
+        "query": f'recording:"{title}" AND artist:"{tail}"',
+        "fmt": "json", "limit": 100, "inc": "artist-credit"})
+    data = _mb_get(f"/recording?{q}", log)
+    if data is None:
+        return None
+    t, a = _norm(title), _norm(tail)
+    if not t or not a:
+        return ""
+    loose = ""
+    for r in data.get("recordings", []):
+        if _norm(str(r.get("title") or "")) != t:
+            continue
+        for cred in r.get("artist-credit", []):
+            name = str(cred.get("name") or "").strip()
+            n = _norm(name)
+            if not n:
+                continue
+            if n == a:
+                return name
+            if not loose and (n in a or a in n):
+                loose = name  # 'Rob D' ~ 'RoB-D' after normalization
+    return loose
+
+
+def _scrub_tracklist(raw: str, log=print) -> str:
+    """Canonical 'Artist - Title' for a tracklist-form upload name; '' when
+    `raw` is not that shape, so the caller leaves it alone.
+
+    All three conditions must hold, because a false scrub retargets the
+    whole pipeline at the wrong song:
+      1. a quoted title with a plausible artist credit IMMEDIATELY behind it
+         (the user's own '(1994)' year tag, '(Explicit)' and a live
+         'Live at ...' credit all fail the tail test);
+      2. the name also identifies itself as a listing - a 'Track 3.'/'Disc
+         2:'/'Side A' marker, or a label ending in '-' / ':' before the
+         quote, which is how the channel puts its own name in front;
+      3. MusicBrainz confirms that artist for that exact title.
+    The quoted text is the title VERBATIM, parentheticals included: '(Shove
+    It)' and '(Kurayamino Mix)' are part of the MusicBrainz recording, while
+    _requested_title strips the technical tags it strips for everyone else.
+    """
+    m = _QUOTED.search(raw)
+    if not m:
+        return ""
+    # \s+ also flattens the nbsp YouTube puts inside these names.
+    title = re.sub(r"\s+", " ", m.group(1)).strip().strip(".,;:\u2013\u2014-")
+    tail = raw[m.end():].strip().strip("\u2013\u2014-:.")
+    prefix = raw[:m.start()]
+    if not title or not tail:
+        return ""
+    if prefix.strip() and not (_TRACKLIST_TAG.search(prefix)
+                               or re.search(r"[-\u2013\u2014:]\s*$", prefix)):
+        return ""
+    if not _tail_is_artist_name(tail):
+        return ""
+    artist = musicbrainz_listing_artist(title, tail, log)
+    if artist is None:
+        # MusicBrainz unreachable: the shape is still a better guess than
+        # the listing, and every MusicBrainz lookup downstream is off anyway.
+        return f"{tail} - {title}"
+    if not artist:
+        return ""
+    return f"{artist} - {title}"
+
+
 def _title_matches(a: str, b: str) -> bool:
     """Fuzzy title identity: misspellings and casing variants are the same
     song ('Feel Goud Inc' ~ 'Feel Good Inc.'); a different song never is
@@ -263,9 +386,18 @@ def _artist_matches(a: str, b: str) -> bool:
 
 
 def discover(raw: str, llm: LLM, use_llm: bool, log=print) -> Target:
+    # A tracklist-form upload name (quoted title + the artist right after
+    # it) is rewritten to the canonical 'Artist - Title' BEFORE anything
+    # else reads it, so the pins, the MusicBrainz lookups, the search
+    # queries and every gate work on the real song instead of on
+    # 'Flix Soundtracks - The Matrix Soundtrack Track 9. "…" Deftones'.
+    scrubbed = _scrub_tracklist(raw, log)
+    if scrubbed:
+        log(f"      tracklist name {raw!r} -> {scrubbed!r}")
+        raw = scrubbed
     raw = raw.strip()
-    # Computed from the original raw before the heuristic branch below
-    # strips a typed "(YYYY)" out of raw.
+    # Computed from the (possibly scrubbed) raw before the heuristic branch
+    # below strips a typed "(YYYY)" out of raw.
     req_year = _requested_year(raw)
     cd_year = ""
     if use_llm:
