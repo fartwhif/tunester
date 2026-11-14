@@ -1000,32 +1000,47 @@ def _cluster_median(durs: list[float]) -> float:
     best = sorted(best)
     return float(best[len(best) // 2])
 
-def musicbrainz_studio_year(artist: str, title: str,
-                            log=print) -> int:
-    """Year of the ORIGINAL studio album the song first appeared on, from
-    MusicBrainz; 0 when it cannot be established.
+# Release-group types that are never "the album the song first appeared
+# on" in the sense the search needs. Live/bootleg is excluded even by the
+# permissive rule below (a concert album is not the studio cut);
+# Compilation/DJ-mix/Remix are excluded only by the STRICT pass: a
+# compilation appearance carries the COMP's edit and date, and the
+# pipeline's whole search (album pluck, duration anchor, year window)
+# then chases the comp instead of the original album.
+_NON_ORIGINAL_RG_TYPES = ("compilation", "dj-mix", "remix")
 
-    Among exact-title recordings (artist match enforced), a recording
-    counts when it carries at least one NON-LIVE album release whose title
-    differs from the song (a live album or a dated concert bootleg —
-    "Boingo Alive", "13 January 1993, Universal Amphitheatre", "Farewell:
-    Live from the Universal Amphitheater" — is not a studio album, and a
-    release titled exactly like the song is the single, not the album).
-    The earliest such recording's release date is the studio album year.
-    The original album always predates its own compilations and live
-    reissues, so earliest is the original, not a greatest-hits.
 
-    This is ground truth for the search year when the user did not type
-    one: MusicBrainz's date is exact, whereas the discover LLM's year is
-    nondeterministic (the same pinned "Just Another Day" returned 1982 and
-    1990) and a wrong year empties musicbrainz_album's +/-1 window AND
-    mis-dates musicbrainz_duration's cluster, so the studio rip becomes
-    unfindable and only concert takes remain — exactly the Oingo Boingo
-    failure this fixes."""
-    recs = _mb_recordings(artist, title, log, limit=100,
-                          inc="release-groups")
-    if recs is None:
-        return 0
+def _rg_type(rel: dict) -> tuple[str, set[str]]:
+    rg = rel.get("release-group") or {}
+    return (str(rg.get("primary-type") or "").lower(),
+            {str(s).lower() for s in (rg.get("secondary-types") or [])})
+
+
+def _on_original_album_release(rel: dict, song_title: str,
+                               strict: bool) -> bool:
+    """True when this release puts the recording on a genuine ORIGINAL
+    album: not the single the song was extracted from (a release titled
+    exactly like the song), not a live album or concert bootleg, and -
+    when `strict` - not a compilation/DJ-mix/remix set. `strict` also
+    requires the group be typed Album, because MB types real albums
+    consistently; the permissive pass keeps the old loose rule for
+    artists whose MB data is patchy."""
+    if _norm(str(rel.get("title") or "")) == _norm(song_title):
+        return False  # the single, not the album
+    primary, secondary = _rg_type(rel)
+    if primary == "live" or "live" in secondary:
+        return False  # live album/bootleg
+    if strict:
+        return (primary == "album"
+                and not (secondary & set(_NON_ORIGINAL_RG_TYPES)))
+    return True
+
+
+def _earliest_studio_album_year(recs: list[dict], artist: str, title: str,
+                                strict: bool) -> int:
+    """Earliest recording date whose artist-matched exact-title recording
+    sits on an original-album release (see
+    `_on_original_album_release`); 0 when no recording qualifies."""
     a, t = _norm(artist), _norm(title)
     best = 0
     for r in recs:
@@ -1041,20 +1056,51 @@ def musicbrainz_studio_year(artist: str, title: str,
         year = int(fd[:4])
         if best and year >= best:
             continue  # only an earlier candidate can win
-        has_studio_album = False
-        for rel in r.get("releases", []):
-            if _norm(str(rel.get("title") or "")) == t:
-                continue  # the single, not the album
-            rg = rel.get("release-group") or {}
-            if str(rg.get("primary-type") or "").lower() == "live" or any(
-                    str(s).lower() == "live"
-                    for s in (rg.get("secondary-types") or [])):
-                continue  # live album/bootleg
-            has_studio_album = True
-            break
-        if has_studio_album:
+        if any(_on_original_album_release(rel, title, strict)
+               for rel in (r.get("releases") or [])):
             best = year
     return best
+
+
+def musicbrainz_studio_year(artist: str, title: str,
+                            log=print) -> int:
+    """Year of the ORIGINAL studio album the song first appeared on, from
+    MusicBrainz; 0 when it cannot be established.
+
+    Among exact-title recordings (artist match enforced), a recording
+    counts when it carries at least one NON-LIVE album release whose title
+    differs from the song (a live album or a dated concert bootleg —
+    "Boingo Alive", "13 January 1993, Universal Amphitheatre", "Farewell:
+    Live from the Universal Amphitheater" — is not a studio album, and a
+    release titled exactly like the song is the single, not the album).
+    The earliest such recording's release date is the studio album year.
+    The original album always predates its own compilations and live
+    reissues, so earliest is the original, not a greatest-hits.
+
+    STRICT pass first: release-groups typed Compilation or DJ-mix are
+    excluded too, because a compilation appearance is NOT the album the
+    song first appeared on in the sense the whole pipeline needs — the
+    comp's edit, date and pressings hijack every downstream stage.
+    'The Crystal Method - Keep Hope Alive' rode trip-hop compilations in
+    1995 (earliest: 'Total Trip Hop' 1995), two years before the band's
+    own debut album, so the permissive rule dated the song 1995, named a
+    2-pressing compilation as its album and anchored the duration on the
+    comp's 316 s edit — which then vetoes the 373 s album cut the whole
+    pipeline exists to deliver. With comps excluded the earliest genuine
+    studio-album appearance is 1996 and the album tally lands on 'Vegas'.
+    If NO recording has a non-compilation album release (the song really
+    did first appear on a compilation, or MB's album data is patchy), the
+    permissive pass below reproduces the old rule — a comp-dated year
+    still beats year 0."""
+    recs = _mb_recordings(artist, title, log, limit=100,
+                          inc="release-groups")
+    if recs is None:
+        return 0
+    for strict in (True, False):
+        y = _earliest_studio_album_year(recs, artist, title, strict)
+        if y:
+            return y
+    return 0
 
 
 
@@ -1168,15 +1214,32 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
     Universal Amphitheatre, Los Angeles" bootleg otherwise ties/outscores
     the real studio album (Bone / Nothing to Fear / Dark at the End of the
     Tunnel) inside a +/-1-year window around a mistyped 1994 and becomes
-    the searched "album", so only concert rips are found."""
-    recs = _mb_recordings(artist, title, log, limit=100)
+    the searched "album", so only concert rips are found.
+
+    Compilation/DJ-mix/Remix groups are dropped by the SAME mechanism but
+    with a fallback (see `_on_original_album_release`): a song that rode
+    compilations before its own album existed gets comp-tally votes from
+    every comp pressing, and one comp with two pressings beat the 14-
+    pressing album outright for 'The Crystal Method - Keep Hope Alive'
+    ('Trip Hop Acid Phunk 3: The Hard Edition', 2 pressings, beat 'Vegas').
+    The strict tally (Album-typed, non-comp groups only) is used when it
+    is not empty; the permissive tally - the old rule, live still
+    excluded - only answers when NO recording sits on a clean Album-typed
+    release, i.e. the song genuinely first appeared on a compilation or
+    MB's album typing is patchy.
+
+    `year` narrows to titles pressed within +/-1 of it - but only if the
+    chosen tally has ANY such pressing; 'Vegas' pressed 1997 wins with or
+    without a window because 14 >> 2."""
+    recs = _mb_recordings(artist, title, log, limit=100,
+                          inc="release-groups")
     if not recs:
         return ""
     a, t = _norm(artist), _norm(title)
     display: dict[str, str] = {}   # norm title -> first-seen surface form
     earliest: dict[str, str] = {}  # norm title -> earliest date
-    counts: dict[str, int] = {}    # norm title -> pressing count
-    window: dict[str, int] = {}    # norm title -> pressings within year +/-1
+    counts: dict[bool, dict[str, int]] = {True: {}, False: {}}
+    window: dict[bool, dict[str, int]] = {True: {}, False: {}}
     for r in recs:
         if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
@@ -1187,27 +1250,29 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
             rt = str(rel.get("title") or "").strip()
             if not rt:
                 continue
-            rg = rel.get("release-group") or {}
-            if str(rg.get("primary-type") or "").lower() == "live" or any(
-                    str(s).lower() == "live"
-                    for s in (rg.get("secondary-types") or [])):
-                continue  # a live album/bootleg is not the studio album
             n = _norm(rt)
-            if n == t:
-                continue
-            display.setdefault(n, rt)
-            counts[n] = counts.get(n, 0) + 1
             d = str(rel.get("date") or "")
-            if d and (n not in earliest or d < earliest[n]):
-                earliest[n] = d
-            if year and re.match(r"\d{4}", d) \
-                    and abs(int(d[:4]) - int(year)) <= 1:
-                window[n] = window.get(n, 0) + 1
-    if not counts:
-        return ""
-    keys = window.keys() if (year and window) else counts.keys()
-    best = min(keys, key=lambda n: (-counts[n], earliest.get(n, "9999")))
-    return display[best]
+            in_window = bool(year) and bool(re.match(r"\d{4}", d)) \
+                and abs(int(d[:4]) - int(year)) <= 1
+            for strict in (True, False):
+                if not _on_original_album_release(rel, title, strict):
+                    continue
+                display.setdefault(n, rt)
+                c = counts[strict]
+                c[n] = c.get(n, 0) + 1
+                if d and (n not in earliest or d < earliest[n]):
+                    earliest[n] = d
+                if in_window:
+                    w = window[strict]
+                    w[n] = w.get(n, 0) + 1
+    for strict in (True, False):
+        c, w = counts[strict], window[strict]
+        if not c:
+            continue
+        keys = w.keys() if (year and w) else c.keys()
+        best = min(keys, key=lambda n: (-c[n], earliest.get(n, "9999")))
+        return display[best]
+    return ""
 
 
 def musicbrainz_cd_year(artist: str, title: str, log=print) -> str:
