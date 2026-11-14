@@ -575,6 +575,57 @@ against 'Phil Collins - Easy Lover' at 0.9889. The gate stack already
 handles the co-artist credits: `_acoustid_identify` scans every recording
 artist-credit in the cluster, and the LLM gate accepted the Bailey-credited
 file name because the named file itself carries the duet credit.
+## Last-resort compilation scan (`_nzb_comp_cands`, 2026-11-14)
+When no normal source (and no album pluck) delivers a verified copy, the
+pipeline browses **every nzb.life audio release credited to the artist**
+(`nzb_artist_releases`, the whole catalog paged past the 100-item page cap)
+and admits the ones whose CONTENT holds the song — judged by the NZB
+manifest, never the release title. The release that carries the track is
+named after the **comp** ('Greatest Hits', 'The Best Of + Vegas + Tweekend'),
+which names neither the song nor the original album, and a greatest-hits may
+not even be a real MusicBrainz album — so no `artist+album` or `artist+title`
+query, album pluck included, can reach it. Runs only after the normal
+`for src` loop is exhausted, strictly last ("last to keep things snappy").
+
+**Content tiers, strongest first** (never position — tracklists lie and
+tracks move; an admitted release is always downloaded and run through the
+duration/AcoustID/LLM gates exactly like a normal source):
+- **tier 2 — a media file in the manifest names the song.** The
+  `Greatest Hits [RSD.2022 PBTHAL LP 24-96 FLAC]` box lists its tracks by
+  name (`03..Self.Esteem.flac` = the user's "file number 3"); `_nzb_album_file`
+  already reads this, so it reuses that. Album pluck skipped this release only
+  because its gate demands the *original album* ('Smash') in the title —
+  'Greatest Hits' never contains it.
+- **tier 1 — no media file names it, but a tracklist sidecar does.**
+  Hash-volume comps post every part as `...::HASH::/...`, so `_nzb_file_name`
+  yields `(1/1)` for all of them and the box admits nothing by name
+  ('Community Service', DAB live boxes, scene boxes whose audio is inside the
+  RAR). `_nzb_sidecar_text` fetches the smallest small `.m3u`/`.m3u8`/`.cue`/
+  `.foc`/`.txt`/`.nfo`/`.log` sidecar (≤512 KiB) as a single NNTP file — a few
+  KB, not the whole box — and `_sidecar_track` applies the same `_title_hit`
+  tiers to each line (`NN - Title` and bare `Title` both normalize). A 104
+  cached manifests under the delivery cache exhibit exactly this no-bare-media
+  + small-sidecar shape, so the tier is load-bearing, not hypothetical.
+
+**Bounded and cache-first:** at most `NZB_COMP_CHECKS` (default 24) manifests
+are read per run — getnzb is per-release and carries a 24 h 'Already
+Downloaded' cooldown, so the scan must not hammer all 89 releases; a cooldown
+or fetch miss just skips that release (the persistent `.nzb` cache makes a
+retry free on the next run). Releases are de-duplicated by URL (one release is
+posted to many groups), already-tried URLs skipped, censored/altered titles
+dropped. The album name (when known) only **orders** the candidates — an
+album-titled box is tried first as the likeliest clean rip — it never
+filters, and there is deliberately **no year filter**: a 2022 reissue of a 1994
+song prints the comp's own year, and the duration/AcoustID gates, not the
+title year, decide whether it is the song.
+
+**Shared trial body:** both the per-source loop and the scan feed
+`_try_candidates`, which downloads → verifies → transcodes each candidate
+until one survives every gate and records every attempted URL in `tried`
+so the scan never re-fetches one. A confident match is a *verified file*,
+not a title that looked right: the first name match does not end the search,
+the first gate-passing delivery does.
+
 ## Usenet curation pitfalls (names are false fronts)
 - 12" maxis are named after the A-side: `Beck-Loser-VLS-FLAC-1994-ERP`
   contains `b1-beck-alcohol.flac` and `b2-beck-fume.flac` with ID3s

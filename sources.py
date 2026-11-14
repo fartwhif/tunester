@@ -30,6 +30,13 @@ HTTP_TIMEOUT = int(os.environ.get("TUNESTER_HTTP_TIMEOUT", "60"))
 NZB_API = os.environ.get("TUNESTER_NZB_API", "https://api.nzb.life")
 NZB_APIKEY = os.environ.get("TUNESTER_NZB_APIKEY", "")
 NZB_I = os.environ.get("TUNESTER_NZB_I", "")
+
+# How many 100-item pages an artist-only release browse pulls
+# (nzb_artist_releases). 5 pages = 500 releases, enough for a prolific
+# artist's whole audio catalog (313 for 'The Crystal Method'); the scan
+# stops early on a short page, so a one-album artist costs one request.
+NZB_ARTIST_PAGES = int(os.environ.get("TUNESTER_NZB_ARTIST_PAGES", "5"))
+
 NNTP_HOST = os.environ.get("TUNESTER_NNTP_HOST", "")
 NNTP_PORT = int(os.environ.get("TUNESTER_NNTP_PORT", "563"))
 NNTP_USER = os.environ.get("TUNESTER_NNTP_USER", "")
@@ -423,32 +430,56 @@ def _nzb_search(artist: str, title: str, year: str = "") -> list[Candidate]:
     return cands
 
 
-def _nzb_query(q: str) -> list[Candidate]:
-    params = urllib.parse.urlencode(
-        {"apikey": NZB_APIKEY, "t": "search", "q": _query_text(q), "cat": "3000"})
-    xml = _nzb_get(f"{NZB_API}/api?{params}", SEARCH_TIMEOUT).decode(
-        "utf-8", "replace")
+def _nzb_query(q: str, pages: int = 1) -> list[Candidate]:
+    """Newznab audio search (cat 3000). The server caps every page at
+    100 items (t=caps: max=100), so an artist-only browse of a prolific
+    artist (313 releases for 'The Crystal Method') needs explicit
+    paging: `pages` fetches offsets 0/100/200/... and stops early on a
+    short page. The default single page keeps the normal artist+title
+    search at its old single-request cost."""
     cands: list[Candidate] = []
-    for item in re.findall(r"<item>.*?</item>", xml, re.S):
-        tm = re.search(r"<title>(.*?)</title>", item, re.S)
-        gm = re.search(r"details/([0-9a-fA-F]+)", item)
-        if not tm or not gm:
-            continue
-        pm = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
-        posted = 0.0
-        if pm:
-            try:
-                posted = parsedate_to_datetime(pm.group(1).strip()).timestamp()
-            except (TypeError, ValueError):
-                pass
-        cands.append(Candidate(
-            source="nzb",
-            url=gm.group(1),
-            title=html.unescape(tm.group(1).strip()),
-            uploader="usenet",
-            posted=posted,
-        ))
+    for off in range(0, max(1, pages) * 100, 100):
+        params = {"apikey": NZB_APIKEY, "t": "search", "q": _query_text(q),
+                  "cat": "3000"}
+        if off:
+            params["offset"] = off
+        xml = _nzb_get(f"{NZB_API}/api?"
+                       + urllib.parse.urlencode(params),
+                       SEARCH_TIMEOUT).decode("utf-8", "replace")
+        items = re.findall(r"<item>.*?</item>", xml, re.S)
+        for item in items:
+            tm = re.search(r"<title>(.*?)</title>", item, re.S)
+            gm = re.search(r"details/([0-9a-fA-F]+)", item)
+            if not tm or not gm:
+                continue
+            pm = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+            posted = 0.0
+            if pm:
+                try:
+                    posted = parsedate_to_datetime(
+                        pm.group(1).strip()).timestamp()
+                except (TypeError, ValueError):
+                    pass
+            cands.append(Candidate(
+                source="nzb",
+                url=gm.group(1),
+                title=html.unescape(tm.group(1).strip()),
+                uploader="usenet",
+                posted=posted,
+            ))
+        if len(items) < 100:
+            break
     return cands
+
+
+def nzb_artist_releases(artist: str) -> list[Candidate]:
+    """Every nzb.life audio release whose TITLE carries the artist name:
+    the artist-credited albums AND the artist-titled comp/best-of boxes
+    that no artist+album or artist+title query can reach (the comp title
+    names neither the song nor the album - 'The Crystal Method - The
+    Best Of + Vegas + Tweekend'). Paged past the 100-item page limit;
+    the pipeline judges each by its NZB manifest, never by the title."""
+    return _nzb_query(artist, pages=NZB_ARTIST_PAGES)
 
 
 def search_candidates(source: Source, artist: str, title: str,

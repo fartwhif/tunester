@@ -31,8 +31,8 @@ from llm import LLM, LLMError
 from sources import (BROWSER_UA, HTTP_TIMEOUT, NNTP_HOST, NNTP_PASS,
                      NNTP_PORT, NNTP_USER, NZB_API, NZB_APIKEY, NZB_I,
                      SOURCES, YTDLP, Candidate, _norm, _nzb_get,
-                     browser_user_agent, make_bad_filter, nzb_configured,
-                     pick, search_candidates, title_present)
+                     browser_user_agent, make_bad_filter, nzb_artist_releases,
+                     nzb_configured, pick, search_candidates, title_present)
 
 FFMPEG = os.environ.get("TUNESTER_FFMPEG", "ffmpeg")
 FFPROBE = os.environ.get("TUNESTER_FFPROBE", "ffprobe")
@@ -1877,6 +1877,24 @@ NZB_ARCHIVE_EXTS = ("rar", "zip", "7z", "tar", "gz", "bz2", "xz", "tgz")
 NZB_MAX_ARCHIVE = (int(os.environ.get("TUNESTER_NZB_MAX_ARCHIVE_MB", "1024"))
                    * 1024 * 1024)
 
+# Last-resort compilation scan (runs only after every normal source is
+# exhausted): browse nzb.life's whole audio catalog for the artist and
+# judge each release by its NZB manifest, never by the release title. The
+# comp that holds the song is titled after the COMP ('Greatest Hits', 'The
+# Best Of + Vegas'), naming neither the song nor the original album - and a
+# greatest-hits may not even be a real MusicBrainz album - so no
+# artist+album or artist+title query can reach it. Bounded so the scan stays
+# snappy: at most NZB_COMP_CHECKS manifests are read (getnzb is per-release
+# and already cached; a cooldown or fetch miss just skips that release), and
+# a tracklist sidecar is fetched only for a release with no media file that
+# names the song.
+NZB_COMP_CHECKS = int(os.environ.get("TUNESTER_NZB_COMP_CHECKS", "24"))
+# Text tracklists that name a release's tracks when its media file names do
+# not: hash-volume comp boxes posted as `...::HASH::/...` whose every part
+# decodes to `(1/1)`. A scene `.m3u`/`.cue`/`.foc` lists `NN - Title`.
+NZB_SIDECAR_EXTS = ("m3u", "m3u8", "cue", "foc", "m3l", "txt", "nfo", "log")
+NZB_SIDE_MAX = 512 * 1024  # a bigger sidecar is not a plain tracklist
+
 
 def _nzb_file_name(subject: str) -> str:
     """Best-effort media file name from a part subject: a quoted
@@ -2243,6 +2261,196 @@ def _nzb_album_cands(target: Target, seen: set[str],
     # is the OLDEST release first - the original pressing.
     return [c for _hit, c in sorted(hits, key=lambda h: (h[0], _rank(h[1])),
                                     reverse=True)]
+
+
+def _nzb_release_files(manifest: bytes) -> list[tuple[str, str, list]] | None:
+    """(subject, group, [(msgid, enc)]) per file in an NZB manifest, or None
+    on bad XML - the listing a release actually contains."""
+    try:
+        root = ET.fromstring(manifest)
+    except ET.ParseError:
+        return None
+    files = []
+    for fe in root.findall(f"{NZB_NS}file"):
+        subj = fe.get("subject") or fe.findtext(f"{NZB_NS}subject") or ""
+        grp = fe.findtext(f"{NZB_NS}groups/{NZB_NS}group") or ""
+        segs = [(se.text.strip(), int(se.get("bytes", 0)))
+                for se in fe.findall(f"{NZB_NS}segments/{NZB_NS}segment")]
+        if segs:
+            files.append((subj, grp, segs))
+    return files
+
+
+def _sidecar_track(text: str, target: Target) -> int:
+    """Title-hit tier of a tracklist line: 2 = the exact title, 1 = the
+    parenthetical-stripped title, 0 = not this song.
+
+    A sidecar line is usually the bare track title ('Self Esteem') or
+    'NN - Artist - Title'; both reduce to the same normalized containment
+    tiers as `_title_hit`, so a compilation is admitted only when its
+    tracklist genuinely names the song - never on which position the song
+    happens to sit at (tracklists lie and tracks move)."""
+    n = _norm(text)
+    if not n:
+        return 0
+    want = _norm(target.title)
+    if want and want in n:
+        return 2
+    core = _core_title(target.title)
+    if core and core != want and core in n:
+        return 1
+    return 0
+
+
+def _nzb_sidecar_text(files, log) -> str | None:
+    """Fetch and decode the smallest small text sidecar (tracklist / nfo)
+    of a release that has no media file naming the song, over NNTP - a
+    single file, so a 120 MB hash-volume box costs a few KB here. None when
+    the release has no fetchable sidecar (or the fetch fails)."""
+    sides = []
+    for subj, grp, segs in files:
+        name = _nzb_file_name(subj)
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if ext not in NZB_SIDECAR_EXTS:
+            continue
+        size = sum(b for _, b in segs)
+        if 0 < size <= NZB_SIDE_MAX:
+            sides.append((len(segs), size, name, grp, segs))
+    if not sides:
+        return None
+    _n, _sz, name, grp, segs = min(sides, key=lambda s: (s[0], s[1]))
+    log(f"        reading tracklist {name!r} ({len(segs)} part(s))")
+    try:
+        import nntplib  # stdlib; absent from Python 3.14+ hosts
+        conn = nntplib.NNTP_SSL(NNTP_HOST, NNTP_PORT, user=NNTP_USER,
+                                password=NNTP_PASS, timeout=30)
+    except Exception as e:
+        log(f"        sidecar NNTP connect failed: {e}")
+        return None
+    blob = b""
+    try:
+        if grp:
+            try:
+                conn.group(grp)
+            except Exception:
+                pass
+        for mid, _enc in segs:
+            try:
+                _resp, info = conn.body(f"<{mid}>")
+            except Exception:
+                log(f"        sidecar part fetch failed: {name}")
+                return None
+            part = _yenc_part(info.lines)
+            if part is None:
+                return None
+            blob += part
+    finally:
+        try:
+            conn.quit()
+        except Exception:
+            pass
+    for enc in ("utf-8", "cp437", "latin-1"):
+        try:
+            return blob.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return blob.decode("latin-1", "replace")
+
+
+def _nzb_comp_cands(target: Target, tried: set[str], log) -> list[Candidate]:
+    """Last-resort compilation scan: when no normal source delivered the
+    song, browse EVERY nzb.life audio release credited to the artist and
+    admit the ones whose CONTENT holds it - judged by the NZB manifest,
+    never the release title, because the release that carries the track is
+    named after the COMP ('Greatest Hits', 'The Best Of + Vegas + Tweekend'),
+    which names neither the song nor the original album and may not be a
+    real album at all.
+
+    Two content tiers, strongest first:
+      2  a media file in the manifest names the song - the box lists its
+         tracks by name ('Greatest Hits' posting `03..Self.Esteem.flac`);
+      1  no media file names it but a tracklist sidecar (.m3u/.cue/.foc)
+         does - the hash-volume comps whose parts all decode to `(1/1)`.
+
+    A release is admitted on CONTENT only; which position the song sits at
+    never decides, so every admitted release is downloaded and run through
+    the duration/AcoustID gates exactly like a normal source. The original-
+    album name, when known, only orders the releases tried (an album-titled
+    box is the likeliest clean rip first) and is NEVER required, or a
+    greatest-hits could not be reached. Capped at NZB_COMP_CHECKS manifest
+    reads (cached after the first run) and never re-touches a release already
+    tried this run."""
+    try:
+        browsed = nzb_artist_releases(target.artist)
+    except Exception as e:
+        log(f"      comp scan: artist browse failed: {e}")
+        return []
+    if not browsed:
+        log("      comp scan: nzb.life has no audio release for this artist")
+        return []
+    bad = make_bad_filter(target.artist)
+    # One release posted to several groups shows up many times: dedup by
+    # URL and drop what was already attempted this run or is a
+    # censored/altered title.
+    # A greatest-hits/reissue prints the COMP's own years ('Greatest Hits
+    # [2005] [RSD.2022]'), NOT the recording's, so NO year filter is applied
+    # here: a 2022 pressing of a 1994 song is exactly what we want, and the
+    # duration/AcoustID gates - not the title year - decide if it is the song.
+    # The album name ranks but never filters.
+    uniq: dict[str, Candidate] = {}
+    for c in browsed:
+        if c.url in tried or c.url in uniq or bad(c.title):
+            continue
+        uniq[c.url] = c
+    if not uniq:
+        log("      comp scan: nothing left to check (all tried or rejected)")
+        return []
+    cands = sorted(
+        uniq.values(),
+        key=lambda c: (bool(target.album) and _norm(target.album) in _norm(c.title),
+                       "flac" in c.title.lower() or "wav" in c.title.lower(),
+                       c.posted), reverse=True)
+    log(f"      comp scan: browsing {len(cands)} artist release(s) "
+        f"(manifest cap {NZB_COMP_CHECKS})")
+    hits: list[tuple[int, Candidate]] = []
+    checked = 0
+    for c in cands:
+        if checked >= NZB_COMP_CHECKS:
+            log(f"      comp scan: manifest cap {NZB_COMP_CHECKS} reached "
+                f"({len(cands) - checked} release(s) not checked)")
+            break
+        checked += 1
+        manifest = _nzb_manifest(c, log)
+        if manifest is None:
+            continue  # getnzb cooldown or fetch error - skip this run
+        found = _nzb_album_file(manifest, target, bad)
+        if found:
+            name, tier = found
+            log(f"      comp scan: {name!r} names the song in {c.title!r}")
+            hits.append((tier, c))
+            continue
+        # No media file names it: try the tracklist sidecar.
+        files = _nzb_release_files(manifest)
+        if not files:
+            continue
+        text = _nzb_sidecar_text(files, log)
+        if text:
+            for line in text.splitlines():
+                if _sidecar_track(line, target):
+                    log(f"      comp scan: tracklist names the song "
+                        f"({line.strip()[:48]!r}) in {c.title!r}")
+                    hits.append((1, c))
+                    break
+    if not hits:
+        log("      comp scan: no artist release contained the song")
+        return []
+    # Best-first: content tier, then an album-titled box, then OLDEST post
+    # (a genuine release predates re-uploads); `tune` then gate-checks each
+    # and moves on when a release dies at download/verify.
+    hits.sort(key=lambda h: (h[0],
+                             bool(target.album) and _norm(target.album)
+                             in _norm(h[1].title), -h[1].posted), reverse=True)
+    return [c for _t, c in hits]
 
 
 def _download_nzb(cand: Candidate, tmp: Path, target: Target,
@@ -2955,6 +3163,64 @@ def target_filename(target: Target) -> str:
     return sanitize_name(name) + ".mp3"
 
 
+def _try_candidates(cands, tmp: Path, cookies, target: Target, llm, opts,
+                    dst: Path, log, tried: set[str]) -> Result | None:
+    """Download -> verify -> transcode each candidate in order; return the
+    first Result that survives every gate, or None when none does.
+
+    Every attempted release URL is recorded in `tried` so the last-resort
+    compilation scan never re-fetches a release this run already touched.
+    A candidate that dies at download, verification, transcode or the
+    output check is dropped and the next one tried: the search ends only at
+    the first copy that passes the gates, never at the first name match
+    (a confident match is a verified file, not a title that looked right).
+    """
+    for cand in cands:
+        tried.add(cand.url)
+        log(f"      try: {cand.title!r} <- {cand.uploader or '?'}")
+        try:
+            got = download(cand, tmp, cookies, target, log, opts.use_cache)
+        except Exception as e:
+            log(f"      download failed: {e}")
+            continue
+        if got is None:
+            continue
+        path, fname = got
+        ok, gate, why = verify_download(path, cand, target, llm,
+                                        opts.use_llm, log, fname)
+        if not ok:
+            log(f"      REJECTED [{gate}]: {why}")
+            path.unlink(missing_ok=True)
+            continue
+        log(f"[3/5] verified uncensored studio recording [{gate}]")
+        log("[4/5] transcode -> MP3 160 kbps CBR / 44.1 kHz / stereo")
+        try:
+            transcode(path, dst, target)
+        except TuneError as e:
+            log(f"      {e}")
+            path.unlink(missing_ok=True)
+            continue
+        info = probe(path) or {}
+        problems = check_output(dst, info.get("duration", 0.0))
+        if problems:
+            log("      " + "; ".join(problems))
+            dst.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            continue
+        if opts.use_cache:
+            # Only what passed every gate is stored, so neither store
+            # ever accumulates previews or mislabeled junk.
+            _cache_put(path, cand.url, fname, log)
+            _delivery_put(dst, target, cand.source, cand.url, log)
+        out_info = probe(dst) or {}
+        log(f"[5/5] done -> {dst}")
+        return Result(target.artist, target.title,
+                      target.cd_year or target.year,
+                      cand.source, cand.url, dst, gate,
+                      out_info.get("duration", 0.0))
+    return None
+
+
 def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
          log=print) -> Result:
     """Run the full pipeline. Returns a Result or raises TuneError."""
@@ -2997,6 +3263,9 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
 
     tmp = Path(tempfile.mkdtemp(prefix="tunester-"))
     sources = [s for s in SOURCES if not opts.source or s.id == opts.source]
+    # Every release URL this run actually attempted; the last-resort
+    # compilation scan never re-fetches one of these.
+    tried: set[str] = set()
 
     try:
         for src in sources:
@@ -3025,48 +3294,23 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
                     target, {c.url for c in cands}, log) + usable
             if not usable:
                 continue
-            for cand in usable[:TRIALS_PER_SOURCE]:
-                log(f"      try: {cand.title!r} <- {cand.uploader or '?'}")
-                try:
-                    got = download(cand, tmp, cookies, target, log, opts.use_cache)
-                except Exception as e:
-                    log(f"      download failed: {e}")
-                    continue
-                if got is None:
-                    continue
-                path, fname = got
-                ok, gate, why = verify_download(path, cand, target, llm,
-                                                opts.use_llm, log, fname)
-                if not ok:
-                    log(f"      REJECTED [{gate}]: {why}")
-                    path.unlink(missing_ok=True)
-                    continue
-                log(f"[3/5] verified uncensored studio recording [{gate}]")
-                log("[4/5] transcode -> MP3 160 kbps CBR / 44.1 kHz / stereo")
-                try:
-                    transcode(path, dst, target)
-                except TuneError as e:
-                    log(f"      {e}")
-                    path.unlink(missing_ok=True)
-                    continue
-                info = probe(path) or {}
-                problems = check_output(dst, info.get("duration", 0.0))
-                if problems:
-                    log("      " + "; ".join(problems))
-                    dst.unlink(missing_ok=True)
-                    path.unlink(missing_ok=True)
-                    continue
-                if opts.use_cache:
-                    # Only what passed every gate is stored, so neither store
-                    # ever accumulates previews or mislabeled junk.
-                    _cache_put(path, cand.url, fname, log)
-                    _delivery_put(dst, target, cand.source, cand.url, log)
-                out_info = probe(dst) or {}
-                log(f"[5/5] done -> {dst}")
-                return Result(target.artist, target.title,
-                              target.cd_year or target.year,
-                              cand.source, cand.url, dst, gate,
-                              out_info.get("duration", 0.0))
+            got = _try_candidates(usable[:TRIALS_PER_SOURCE], tmp, cookies,
+                                  target, llm, opts, dst, log, tried)
+            if got is not None:
+                return got
+        if any(s.kind == "nzb" for s in sources) and nzb_configured():
+            # Nothing under the song's own name or its original album
+            # delivered a verified copy. Last resort: browse the artist's
+            # whole audio catalog and gate-check the compilations that
+            # contain the track but are named after the COMP, not the song
+            # (or its album) - see `_nzb_comp_cands`.
+            log("[2/5] last resort: scanning the artist's releases for a "
+                "compilation that contains the song")
+            comp = _nzb_comp_cands(target, tried, log)
+            got = _try_candidates(comp[:TRIALS_PER_SOURCE], tmp, cookies,
+                                  target, llm, opts, dst, log, tried)
+            if got is not None:
+                return got
         raise TuneError("all sources exhausted - no verified uncensored copy found",
                         target=target)
     finally:
