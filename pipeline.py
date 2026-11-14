@@ -505,14 +505,10 @@ def _mb_confirm_title(artist: str, title: str, log=print) -> str:
         groups = _groups_with_cuts(t)[0]
         if not groups:
             return t  # bare stem: nothing to confirm, nothing to peel
-        q = urllib.parse.urlencode({
-            "query": f'recording:"{t}" AND artist:"{artist}"',
-            "fmt": "json", "limit": 25})
-        data = _mb_get(f"/recording?{q}", log)
-        if data is None:
+        recs = _mb_recordings(artist, t, log, limit=25)
+        if recs is None:
             return t  # MusicBrainz unreachable: trust the verdict engine
-        if any(_rec_title_ok(str(r.get("title") or ""), t)
-               for r in data.get("recordings", [])):
+        if any(_rec_title_ok(str(r.get("title") or ""), t) for r in recs):
             return t
         s, e, c = max(groups, key=lambda g: g[0])
         rest = t[:s] + t[e:]
@@ -625,17 +621,15 @@ def musicbrainz_listing_artist(title: str, tail: str,
     and Marilyn Manson's are not in the first 25, so a small limit reads as
     'no such recording' and silently skips the scrub.
     """
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{title}" AND artist:"{tail}"',
-        "fmt": "json", "limit": 100, "inc": "artist-credit"})
-    data = _mb_get(f"/recording?{q}", log)
+    data = _mb_recordings(tail, title, log, limit=100,
+                          inc="artist-credit")
     if data is None:
         return None
     t, a = _norm(title), _norm(tail)
     if not t or not a:
         return ""
     loose = ""
-    for r in data.get("recordings", []):
+    for r in data:
         if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         for cred in r.get("artist-credit", []):
@@ -911,6 +905,86 @@ def _mb_get(path: str, log) -> dict | None:
     return None
 
 
+# MusicBrainz matches its `artist:` clause against the CREDIT TEXT stored
+# on each recording, not against the artist ENTITY the recording is linked
+# to, so a recording credited 'Offspring' is INVISIBLE to
+# artist:"The Offspring" although it belongs to that entity: three of the
+# recordings titled "Self Esteem" are (2026-11-13: 41 recordings for the
+# text clause, 44 with the entity union), and the studio master
+# 5a57b450-fecd-4ab5-a400-1e4b5d22dfbc - the 257 s track 8 of "Smash" -
+# is one of them. Every derivation in this file then saw only the alias
+# siblings: studio_year 1995, album 'Come Out and Play' (the 240 s single,
+# which Smash never appears on), a 240 s anchor - so the duration gate
+# vetoed every genuine Smash CD rip and the album pluck searched an album
+# that never carried the song. Unioning the entity ids back in restores
+# 1994 / 'Smash' / 257 s; verified by replaying the real functions over
+# both query forms, where six control songs with no alias credits
+# (Nena, a-ha, Men Without Hats, Oingo Boingo, Phil Collins, Deep Blue
+# Something) return identical payloads and identical answers.
+_MB_IDS: dict[str, list[str]] = {}
+_MB_IDS_LOCK = threading.Lock()
+
+
+def _artist_ids(artist: str, log) -> list[str]:
+    """MusicBrainz entity ids whose NAME is exactly `artist`; [] when the
+    name resolves to no entity or MusicBrainz does not answer.
+
+    Only NAME-equal entities qualify: the point is the artist the user
+    typed, as an ENTITY, whose own recordings carry other credit text.
+    `exact=on` still returns near-matches ('The Offspring M.D' comes back
+    for "The Offspring"), so the names are compared here. A differently
+    named band sharing the name ('Phil Collins Trio') is excluded here and
+    stays excluded downstream by the credit-text containment filter every
+    consumer already applies. Cached per normalized name, so the union
+    costs one lookup per artist per process, not one per query."""
+    key = _norm(artist)
+    if not key:
+        return []
+    with _MB_IDS_LOCK:
+        if key in _MB_IDS:
+            return _MB_IDS[key]
+    q = urllib.parse.urlencode({"query": f'artist:"{artist}"',
+                                "fmt": "json", "limit": 8, "exact": "on"})
+    ids = [str(a["id"]) for a in (_mb_get(f"/artist?{q}", log) or {}).get(
+        "artists") or [] if a.get("id")
+        and _norm(str(a.get("name") or "")) == key][:4]
+    with _MB_IDS_LOCK:
+        if len(_MB_IDS) > 256:
+            _MB_IDS.clear()
+        _MB_IDS[key] = ids
+    return ids
+
+
+def _mb_recordings(artist: str, title: str, log, *, limit: int,
+                   inc: str = "") -> list[dict] | None:
+    """Recordings a title search returns for `artist`, or None when
+    MusicBrainz never answered. Most consumers treat "no answer" and "no
+    match" alike (an empty tally is simply no album) and take the list;
+    `_mb_confirm_title` and `musicbrainz_listing_artist` must keep the
+    distinction, because an unreachable MusicBrainz means TRUST what the
+    verdict engine left, not peel or skip the scrub.
+
+    The artist clause is the credit text OR the entities `_artist_ids`
+    resolves (see the note above them) - every derivation here reads this
+    one recording set (studio year, album, tag year, duration anchor,
+    album-artist names, the title ladder), so a query blind to the
+    artist's own alias-credited recordings gets all of them wrong at once.
+    `limit` and `inc` pass through unchanged: each consumer's own cap and
+    embed decide its answer, so a shared helper must not restate them."""
+    who = f'artist:"{artist}"'
+    ids = _artist_ids(artist, log)
+    if ids:
+        who = "(" + " OR ".join([who] + [f'arid:"{i}"' for i in ids]) + ")"
+    params = {"query": f'recording:"{title}" AND {who}',
+              "fmt": "json", "limit": limit}
+    if inc:
+        params["inc"] = inc
+    data = _mb_get(f"/recording?{urllib.parse.urlencode(params)}", log)
+    if data is None:
+        return None
+    return data.get("recordings") or []
+
+
 def _cluster_median(durs: list[float]) -> float:
     """Median of the largest within-15s cluster; 0.0 when <2 agree."""
     if len(durs) < 2:
@@ -948,15 +1022,13 @@ def musicbrainz_studio_year(artist: str, title: str,
     mis-dates musicbrainz_duration's cluster, so the studio rip becomes
     unfindable and only concert takes remain — exactly the Oingo Boingo
     failure this fixes."""
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{title}" AND artist:"{artist}"',
-        "fmt": "json", "limit": 100, "inc": "release-groups"})
-    data = _mb_get(f"/recording?{q}", log)
-    if not data:
+    recs = _mb_recordings(artist, title, log, limit=100,
+                          inc="release-groups")
+    if recs is None:
         return 0
     a, t = _norm(artist), _norm(title)
     best = 0
-    for r in data.get("recordings", []):
+    for r in recs:
         if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "")
@@ -1014,12 +1086,9 @@ def musicbrainz_duration(artist: str, title: str, year: str,
     a, t = _norm(artist), _norm(title)
     if album:
         al = _norm(album)
-        q = urllib.parse.urlencode({
-            "query": f'recording:"{title}" AND artist:"{artist}"',
-            "fmt": "json", "limit": 60, "inc": "releases"})
-        data = _mb_get(f"/recording?{q}", log)
         lens: list[int] = []
-        for r in (data or {}).get("recordings", []):
+        for r in _mb_recordings(artist, title, log, limit=60,
+                                inc="releases") or []:
             if not _rec_title_ok(str(r.get("title") or ""), title):
                 continue
             ac = _norm(" ".join(x.get("name", "")
@@ -1047,14 +1116,8 @@ def musicbrainz_duration(artist: str, title: str, year: str,
         if lens:
             lens.sort()
             return float(lens[len(lens) // 2])
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{title}" AND artist:"{artist}"',
-        "fmt": "json", "limit": 30})
-    data = _mb_get(f"/recording?{q}", log)
-    if not data:
-        return 0.0
     dated: list[tuple[int | None, int]] = []
-    for r in data.get("recordings", []):
+    for r in _mb_recordings(artist, title, log, limit=30) or []:
         try:
             length = int(r.get("length") or 0) // 1000
         except (TypeError, ValueError):
@@ -1106,18 +1169,15 @@ def musicbrainz_album(artist: str, title: str, year: str = "",
     the real studio album (Bone / Nothing to Fear / Dark at the End of the
     Tunnel) inside a +/-1-year window around a mistyped 1994 and becomes
     the searched "album", so only concert rips are found."""
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{title}" AND artist:"{artist}"',
-        "fmt": "json", "limit": 100})
-    data = _mb_get(f"/recording?{q}", log)
-    if not data:
+    recs = _mb_recordings(artist, title, log, limit=100)
+    if not recs:
         return ""
     a, t = _norm(artist), _norm(title)
     display: dict[str, str] = {}   # norm title -> first-seen surface form
     earliest: dict[str, str] = {}  # norm title -> earliest date
     counts: dict[str, int] = {}    # norm title -> pressing count
     window: dict[str, int] = {}    # norm title -> pressings within year +/-1
-    for r in data.get("recordings", []):
+    for r in recs:
         if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "") for x in r.get("artist-credit", [])))
@@ -1159,15 +1219,10 @@ def musicbrainz_cd_year(artist: str, title: str, log=print) -> str:
     wins. MB's early-CD coverage is patchy (an early pressing can be a
     label-less stub, or missing entirely), so the LLM's answer is
     preferred when it has one."""
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{title}" AND artist:"{artist}"',
-        "fmt": "json", "limit": 100, "inc": "releases"})
-    data = _mb_get(f"/recording?{q}", log)
-    if not data:
-        return ""
     a, t = _norm(artist), _norm(title)
     official, other = "", ""
-    for r in data.get("recordings", []):
+    for r in _mb_recordings(artist, title, log, limit=100,
+                            inc="releases") or []:
         if not _rec_title_ok(str(r.get("title") or ""), title):
             continue
         ac = _norm(" ".join(x.get("name", "")
@@ -2010,17 +2065,15 @@ def _album_credit_names(target: Target, log) -> list[str]:
     """
     if not target.album:
         return []
-    q = urllib.parse.urlencode({
-        "query": f'recording:"{target.title}" AND artist:"{target.artist}"',
-        "fmt": "json", "limit": 60, "inc": "releases"})
-    data = _mb_get(f"/recording?{q}", log)
-    if not data:
+    recs = _mb_recordings(target.artist, target.title, log, limit=60,
+                          inc="releases")
+    if not recs:
         return []
     a, t, al = (_norm(target.artist), _norm(target.title),
                 _norm(target.album))
     display: dict[str, str] = {}
     counts: dict[str, int] = {}
-    for r in data.get("recordings", []):
+    for r in recs:
         if not _rec_title_ok(str(r.get("title") or ""), target.title):
             continue
         ac = _norm(" ".join(x.get("name", "")

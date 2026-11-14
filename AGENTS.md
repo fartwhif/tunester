@@ -778,6 +778,82 @@ fix below.
   (Weird Science's `snacks version`): only the live claim is fingerprint-
   refutable. `unknown` still refuses — when unsure, match=false stands.
 
+## MusicBrainz: `artist:` matches CREDIT TEXT, not the artist ENTITY (2026-11-13)
+MB's search `artist:"X"` clause is matched against the **credit text
+stored on each recording**, not against the artist ENTITY the recording is
+linked to. A recording credited `Offspring` therefore does NOT match
+`artist:"The Offspring"` even though it belongs to that entity — the alias
+lives in the entity and the search never consults it.
+
+`The Offspring - Self Esteem` is the case: 41 recordings come back for the
+text clause, 44 with the entity union, and the 3 only the union sees are
+credited `Offspring` on entity `23a03e33-a603-404e-bcbf-2c00159d7067` —
+including the studio master `5a57b450-fecd-4ab5-a400-1e4b5d22dfbc`, the
+257 826 ms track 8 of **Smash** (verified against pressings only the
+payload lists: release `91587782`, 1994-04-19, carries that recording id at
+257 826 ms). Every derivation reads the SAME recording set, so hiding the
+master broke all of them at once: `musicbrainz_studio_year` 1995,
+`musicbrainz_album` `'Come Out and Play'` (the 240 s single — Smash appears
+nowhere in the text payload), anchor 240 s, `musicbrainz_cd_year` 2002 (a
+greatest-hits CD), so the duration gate vetoed every genuine Smash rip, the
+album pluck searched an album that never carried the song, and GrabbyTube
+could only ever write a `fixup`.
+
+**`_mb_recordings(artist, title, log, *, limit, inc="")` is now the only
+recording-search entry point** (it replaced the per-callee `_mb_get`
+queries) and it queries `recording:"T" AND (artist:"A" OR arid:"<id>" …)`:
+- `_artist_ids(artist, log)` resolves the typed name to MB entities and
+  keeps only those whose **name is exactly** the typed name — `exact=on`
+  still returns near-matches (`The Offspring M.D` comes back for "The
+  Offspring"), so the names are compared here. The union therefore adds
+  only this artist's OWN recordings: it is a strict superset of the text
+  query, and a differently-named band sharing the name (`Phil Collins
+  Trio`) is excluded here and still excluded downstream by the credit-text
+  containment filter every consumer already applies. Cached per normalized
+  name in `_MB_IDS` — one `/artist` lookup per artist per process, not per
+  query.
+- `limit` / `inc` pass through unchanged: each consumer's own cap and
+  embed decide its answer, so a shared helper must not restate them. `None`
+  (MusicBrainz unreachable) stays distinguishable from `[]` (no match) —
+  `_mb_confirm_title` must TRUST the verdict engine on `None` and peel on
+  `[]`, and `musicbrainz_listing_artist` must skip the scrub on `None`.
+- All 8 recording-query sites consume it: `musicbrainz_studio_year`,
+  `musicbrainz_album`, `musicbrainz_cd_year`, both `musicbrainz_duration`
+  branches, `_album_credit_names`, `_mb_confirm_title`,
+  `musicbrainz_listing_artist`.
+
+**Verified by replaying the real functions over both query forms.** Patched
+`_mb_get` to the union and re-ran the derivations: Self Esteem ->
+`album='Smash'`, anchor 257 s, studio_year 1994, cd_year 1994 (from
+`'Come Out and Play'` / 240 / 1995 / 2002), and the six control songs with
+no alias credits returned identical payloads and identical answers (Nena
+1983 `Nena` 233, a-ha 1984 `Hunting High and Low` 229, Men Without Hats
+1982 `Rhythm of Youth` 277, Oingo Boingo 1985 `Dead Man's Party` 313, Phil
+Collins 1984 `Chinese Wall` 305 + `Philip Bailey`, Deep Blue Something 1993
+`Home` 257) — each added 0 recordings, so the union changes nothing where
+nothing is aliased. Same seven cases run as a battery against the shipped
+code (`/tmp/t10.py`): 7/7 PASS.
+
+**Truncation was measured, not assumed.** The union enlarges the pool while
+every consumer keeps its `limit` cap, so a common title on a prolific
+artist could in principle crowd the studio master out of the page. `a-ha -
+Take On Me` is that worst case (109 recordings; the text query alone fills
+the 100 cap): every entity-owned recording is still on page 1 under the
+union (page 2 holds 9 either way) and the master sits rank 51 of 100 — and
+a-ha has no alias credits, so its text pool was already complete. A future
+title whose union pool exceeds the cap is the signal to page, not to drop
+the union.
+
+**What this deliberately does NOT change** (owner decision 2026-11-13,
+alias scope): `musicbrainz_album`'s tally still discards Compilation-typed
+release groups. `Greatest Hits` pressings DO carry the studio recording —
+17–20 of them in the same payload, track 3 at 257 826 ms — and they are
+invisible to the tally in a second way as well (MB credits those releases
+with the alias text too). Ranking carriers by recording identity so an
+unrippable original falls back to the NEXT REAL CARRIER album is deferred;
+the album pluck's existing next-pressing fallback covers what scene
+actually has.
+
 ## Video fallback (nzb)
 Audio files always beat video files within a release; video containers
 (mkv/mp4/…) are fetched and transcoded audio-only (`-vn`), then QC'd.
