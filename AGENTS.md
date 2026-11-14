@@ -678,6 +678,15 @@ the first gate-passing delivery does.
   the exact-title recording ACTUALLY appears on, so an empty LLM album
   or any wrong guess yields to it; only an EMPTY tally (standalone
   single, API failure) keeps the LLM's album.
+- **The album tally excludes compilations explicitly now (2026-11-14).**
+  It relied on "comps appear once, so the most-pressed rule discards them",
+  but that fails when a multi-pressing comp outscores the album: 'Keep Hope
+  Alive' — a 2-pressing comp ('Trip Hop Acid Phunk 3') beat the 14-pressing
+  'Vegas'. `musicbrainz_album` now runs a STRICT tally first (Album-typed,
+  non-comp groups, via `_on_original_album_release`) and only falls back to
+  the permissive tally (the old loose rule, live still excluded) when no
+  recording sits on a clean Album-typed release. Measured: Keep Hope Alive
+  comp -> Vegas (14 pressings), anchor 316s -> 372s.
 
 - All LLM prompts (system + user) are appended to the status ticker via
   `LLM(log=...)` inside `chat()` — single choke point; both the discover
@@ -760,6 +769,15 @@ fix below.
   the true studio lengths 314/229/254/283/257/251 s. The override fires
   ONLY with no typed year (a free-form "...from 1986" still defers to the
   LLM, and an explicit `(YYYY)` still pins, as above).
+- **Compilations are excluded from the studio-year rule too (2026-11-14).**
+  A song that rode compilations *before its own album existed* is dated by
+  the comps, not the album: 'Keep Hope Alive' first appeared on trip-hop
+  comps in 1995, two years before its debut, so the permissive NON-live rule
+  dated it 1995. `musicbrainz_studio_year` now runs a STRICT pass first that
+  also drops Compilation/DJ-mix/Remix groups (requires Album typing — MB
+  applies it consistently) via the shared `_on_original_album_release`,
+  falling back to the old permissive rule only when no recording sits on a
+  clean Album-typed release. Measured: Keep Hope Alive 1995 -> 1996.
 - **The ACTUAL reason the album was always empty was a silent
   positional-argument regression, NOT the year and NOT rate limits.**
   `Target`'s fields went `artist, title, year, album` -> `discover` line
