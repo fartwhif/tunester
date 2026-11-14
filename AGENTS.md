@@ -854,6 +854,22 @@ unrippable original falls back to the NEXT REAL CARRIER album is deferred;
 the album pluck's existing next-pressing fallback covers what scene
 actually has.
 
+**Second beneficiary, measured end to end: `The Prodigy - Mindfields`.**
+The text-only query returned 25 recordings and none of the 338–340 s studio
+pressings; the union returns 30 and adds five credited `Prodigy`, including
+the master — 339 906 ms, first released 1997-06-30, on **73 releases**
+including the 1997 `The Fat of the Land`. With the text payload alone the
+album tally fell to the only bare-title candidate it could see, the VA
+compilation `'The Matrix: Music from and inspired by the Motion Picture'`,
+and the anchor landed on a 343–347 s sibling; with the union the tally
+picks `The Fat of the Land` (the pressing count is what breaks ties) at the
+true 339 s, `cd_year` 1997 instead of 1999, and the run delivers the
+`REPACK-CD-FLAC-1997-AUDIO` rip at AcoustID 100 % where the old query
+could only ever write a fixup. Re-ran the four derivations 2x (text) and 3x
+(union): each form reproduced its own numbers exactly, so the change makes
+the derivation MORE deterministic here, not less — the union supplies the
+high-pressing recording the tally was always meant to rank on.
+
 ## Video fallback (nzb)
 Audio files always beat video files within a release; video containers
 (mkv/mp4/…) are fetched and transcoded audio-only (`-vn`), then QC'd.
