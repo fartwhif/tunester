@@ -103,11 +103,17 @@ read such an entry as absent, so `lookups.get` has its own rule.
   no streaming make the reply a function of those five alone, the **api key is
   deliberately absent** (it authorizes a request, it does not change the answer,
   and rotating it must not invalidate the verdicts it bought — same reasoning as
-  the AcoustID `client` key above), and the key is RE-DERIVED after a 404 model
-  substitution, so an entry never claims to be an answer from a model that never
-  produced it. The base URL is in the identity because an inference host answers an
-  id it does not serve by aliasing it to whatever it has loaded (this box's own
-  GPU peer does exactly that), so the same id on another host is a different model.
+  the AcoustID `client` key above). A 404 model substitution persists the
+  resolved id **on the endpoint** (`llm.LLM._send`: `ep.model = …`), not just
+  into that one request's body: every call re-derives its key from the model
+  id it is about to send, so a store filled under an id the server rejected
+  could never be hit again and each new tune would re-pay the 404 plus the
+  `/models` round-trip for nothing. The endpoint lives as long as the client,
+  so one client resolves once and an entry never claims to be an answer from
+  a model that never produced it. The base URL is in the identity because an
+  inference host answers an id it does not serve by aliasing it to whatever
+  it has loaded (this box's own GPU peer does exactly that), so the same id
+  on another host is a different model.
   `pipeline.tune` wraps the whole run in `lookups.enabled_scope(opts.use_cache)`,
   so `--no-llm` still caches (it never reaches `chat`) but `--no-cache` publishes
   nothing — an LLM answer must not leak past the switch that exists to make a run
@@ -719,8 +725,12 @@ duration/AcoustID/LLM gates exactly like a normal source):
   yields `(1/1)` for all of them and the box admits nothing by name
   ('Community Service', DAB live boxes, scene boxes whose audio is inside the
   RAR). `_nzb_sidecar_text` fetches the smallest small `.m3u`/`.m3u8`/`.cue`/
-  `.foc`/`.txt`/`.nfo`/`.log` sidecar (≤512 KiB) as a single NNTP file — a few
-  KB, not the whole box — and `_sidecar_track` applies the same `_title_hit`
+  `.foc`/`.txt`/`.nfo`/`.log` sidecar (≤512 KiB; `min(sides)` picks the
+  smallest qualifying one, so a 200 KB `.nfo` listed after a 900 B `.m3u`
+  does not cost the KB that the size tuple was built to reject — an earlier
+  build ranked the candidates and then fetched the LAST qualifier) as a
+  single NNTP file — a few KB, not the whole box — and `_sidecar_track`
+  applies the same `_title_hit`
   tiers to each line (`NN - Title` and bare `Title` both normalize). A 104
   cached manifests under the delivery cache exhibit exactly this no-bare-media
   + small-sidecar shape, so the tier is load-bearing, not hypothetical.

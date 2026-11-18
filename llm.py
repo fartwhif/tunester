@@ -219,7 +219,16 @@ class LLM:
                 if e.code == 404 and "model" in detail.lower() \
                         and not ep.resolved_model:
                     ep.resolved_model = True
-                    body["model"] = self._resolve_model(ep)
+                    # Persisted on the endpoint, not just swapped into this
+                    # body: every call re-derives its cache key from
+                    # `body["model"]`, and a key built from an id the server
+                    # rejected can NEVER hit the verdict the resolved id
+                    # produced - each new chat() would re-pay the 404 plus
+                    # the /models round-trip for nothing, and the store
+                    # would fill under a key nobody asks with. The endpoint
+                    # lives as long as the client, so one client resolves
+                    # once; a fresh client re-derives once too.
+                    ep.model = body["model"] = self._resolve_model(ep)
                     continue
                 raise LLMError(f"HTTP {e.code}: {detail}")
             except urllib.error.URLError as e:

@@ -2413,9 +2413,16 @@ def _nzb_sidecar_text(files, log, url: str = "") -> str | None:
             continue
         size = sum(b for _, b in segs)
         if 0 < size <= NZB_SIDE_MAX:
-            sides.append((len(segs), size, name, grp, segs))
+            sides.append((size, len(segs), name, grp, segs))
     if not sides:
         return None
+    # The SMALLEST qualifying sidecar, not the last one that qualified. The
+    # ranking tuple existed but was never consulted, so a release carrying
+    # a 200 KB .nfo beside a 900 B .m3u got the .nfo pulled whenever it
+    # came later in the manifest - the size cap's whole point is that this
+    # read costs KB. The pick also decides the cached identity below, so
+    # the same posting yields the same key on every run either way.
+    _size, _parts, name, grp, segs = min(sides)
     # Message-ids ARE the answer's identity: the same posting yields the
     # same articles, so a re-run reads the same bytes. `url` (the nzb.life
     # release id) goes into the sidecar's provenance, not the key, so the
@@ -3055,6 +3062,16 @@ def _acoustid_lookup(fp: str, dur: int, log) -> list[dict] | None:
     # otherwise pay the API all over again to re-derive.
     qkey = ("acoustid", ACOUSTID_HOST, fp, str(dur))
 
+    # The form body is rebuilt on every call: `client` is ACOUSTID_KEY read
+    # here, and the qkey above deliberately omits it, so a key rotation costs
+    # nothing that is already stored. Dropping this line while wrapping the
+    # request in a closure once made EVERY lookup die inside its own
+    # except-handler (an UnboundLocalError IS an Exception) and answer "the
+    # service never responded" - which read as "no fingerprint gate needed"
+    # and let every file through unjudged.
+    body = urllib.parse.urlencode({
+        "client": ACOUSTID_KEY, "fingerprint": fp, "duration": str(dur),
+        "meta": "recordings", "format": "json"})
     def fetch() -> bytes | None:
         for attempt in range(4):
             try:
