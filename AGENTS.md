@@ -667,7 +667,10 @@ makes the release visible to the same checks.
    being offered for a neighbour's song. On the live cache the sweep admits 6
    releases for Goodbye Goodbye: the three obfuscated single-file postings plus
    `Best O' Boingo` (FLAC) and two `Boingo Alive` boxes, ranked lossless-first
-   then oldest-posting, album-titled above the VA-shaped ones.
+   then oldest-posting, album-titled above the VA-shaped ones. (Those 6 in an
+   offline sweep; a live run admits 2, because the 3 single-file postings and
+   the Best O' Boingo rip are URLs the compilation scan already tried and the
+   sweep de-dupes against `tried`.)
 
 **Nothing is relaxed after admission.** Every hit goes back through
 `_try_candidates` — probe, MusicBrainz length anchor, AcoustID attribution +
@@ -679,6 +682,21 @@ posted subjects, the VA non-admissions, the ranking, the uploader/date
 provenance, and a `tune`-level run with every network primitive poisoned
 proving both that a swept release is gate-decided (no delivery) and that the
 sweep is what turns a gate-passing cached release into one.
+
+**Deployed proof (2026-11-18, hub container):** a real `POST /api/tune` for
+`Oingo Boingo - Goodbye Goodbye` (anchor 234 s, the Fast Times studio cut)
+reaches `[2/5] final fallback: sweeping the cached NZB manifests …` and admits
+**2** releases — `Oingo Boingo - 1988 - NMR - Boingo Alive (CD 2)` (file
+`14 - Goodbye Goodbye.flac`) and `Oingo Boingo-Boingo Alive-2CD-1988-EOS` (file
+`214-oingo_boingo-goodbye_goodbye-eos.mp3`) — i.e. the two boxes the search, the
+album pluck and the compilation browse had never surfaced. Both were fetched,
+both `REJECTED [duration]: 212s vs ~234s`: the song on `Boingo Alive` is the live
+version, so the run ends `all sources exhausted` — the correct answer, reached
+through the new layer rather than around it. The 4 candidates named in the
+offline count are already in `tried` (`_try_candidates` records every attempted
+release URL, `_nzb_cached_cands` seeds `seen` from it), so they are not offered
+twice. No cached tune regressed: `The Offspring - Self Esteem` still answers
+`done` from the content store in ~20 s with no sweep.
 
 ## Usenet curation pitfalls (names are false fronts)
 - 12" maxis are named after the A-side: `Beck-Loser-VLS-FLAC-1994-ERP`
