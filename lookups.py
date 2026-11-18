@@ -113,13 +113,21 @@ def lookup_ttl(kind: str) -> float | None:
     return None if kind == "text" else 3600.0 * hours
 
 
-def key(*parts: str) -> str:
+def key(*parts: object) -> str:
     """Store key of one answer: sha1 over its identity parts.
 
     Every part must be part of the ANSWER's identity, not of the call: the
     request URL, the fingerprint + duration, the model id + full prompt.
-    Joined on \\x1f so `("ab","c")` and `("a","bc")` differ."""
-    return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
+    Joined on \\x1f so `("ab","c")` and `("a","bc")` differ. Parts are
+    stringified rather than joined raw: a caller that passes the number it
+    asked with (`depth`, a duration) is naming the answer, and
+    `"\x1f".join` raising `TypeError` inside the cache would take the whole
+    search down - a wrapper must never be the reason a source finds nothing.
+    `str()` of a str is itself, so the keys of every existing entry are
+    unchanged."""
+    return hashlib.sha1(
+        "\x1f".join(p if isinstance(p, str) else str(p)
+                    for p in parts).encode("utf-8")).hexdigest()
 
 def get(sub: str, entry: str, ttl: float | None) -> bytes | None:
     """Payload of a live cached answer, or None on miss/expiry/disabled.

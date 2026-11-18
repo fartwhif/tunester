@@ -90,9 +90,16 @@ read such an entry as absent, so `lookups.get` has its own rule.
   `("ao", url)` (archive.org `advancedsearch` listings at kind `search`,
   `metadata/<identifier>` item records at kind `reference`), and
   `("ytdlp", prefix, depth, "artist title", cookie-state)` for a yt-dlp
-  **search listing**. The nzb.life key carries the apikey VALUE (so a key rotation
-  that changes the account's quota cannot serve another account's ranking). The
-  archive.org metadata key is the **identifier**, not the query that found it, so
+  **search listing**. `lookups.key` stringifies its parts rather than
+  `"\x1f".join`-ing them raw: `depth` is the NUMBER the search asked with,
+  and a `TypeError` raised inside the cache wrapper took the whole yt-dlp
+  source down (the SoundCloud search died with `sequence item 2: expected
+  str instance, int found`) instead of missing a key — a wrapper must never
+  be the reason a source finds nothing. `str()` of a str is itself, so no
+  stored key changed. The nzb.life key carries the apikey VALUE (so a key
+  rotation that changes the account's quota cannot serve another account's
+  ranking). The archive.org metadata key is the **identifier**, not the query
+  that found it, so
   the expensive half of an archive search — one metadata GET per candidate item,
   up to 15 per query, three queries — costs the API once per item for the whole
   reference TTL no matter which query or which tune asks next.
