@@ -13,6 +13,7 @@ first one to return a valid response wins.
 import json
 import os
 import re
+import lookups
 import socket
 import time
 import urllib.error
@@ -95,6 +96,16 @@ class LLMEndpoint:
         self.resolved_model = False
 
 
+def _chat_key(base_url: str, model: str, max_tokens: int,
+              system: str, user: str) -> str:
+    """Store key of one LLM answer: sha1 over everything that decides the
+    reply. `temperature 0` and no streaming make the reply a function of
+    these five values alone; the api key is deliberately absent (it
+    authorizes a request, it does not change the answer, and rotating it
+    must not invalidate the verdicts it bought)."""
+    return lookups.key(base_url, model, str(int(max_tokens)), system, user)
+
+
 def _llm_endpoints() -> list[LLMEndpoint]:
     """LLM backends in priority order; index 0 is tried first. A backend
     whose base URL is not configured (env / .env) is dropped, so a machine
@@ -157,9 +168,31 @@ class LLM:
             "stream": False,
             "thinking": {"type": "enabled", "budget_tokens": THINK_BUDGET},
         }
+        # A verdict is worth keeping: `temperature 0` plus a fixed prompt
+        # makes this call a pure function of (server, model id, sampling
+        # params, prompt), and the QC gate asks the same question about the
+        # same candidate every time a library re-tunes it. The store keeps
+        # the TEXT, not the HTTP envelope, and only a valid reply is ever
+        # published - a timeout, a 503 cold start or an unparseable answer
+        # costs the next call the same wait this one paid.
+        #
+        # The server's base URL belongs in the identity, not only the model
+        # id: an inference host answers a model id it does not serve by
+        # aliasing it to whatever it has loaded - this box's GPU peer does
+        # exactly that - so the same id on another host is a different model.
+        # The key is re-derived after a 404 model substitution, so an entry never
+        # claims to be an answer from a model that never produced it.
         url = ep.base_url + "/chat/completions"
         deadline = time.time() + budget
         while True:
+            ckey = _chat_key(ep.base_url, body["model"], max_tokens,
+                             system, user)
+            cached = lookups.get(lookups.LLM_STORE, ckey,
+                                 lookups.lookup_ttl("llm"))
+            if cached is not None:
+                if self.log:
+                    self.log("        lookup cache hit (llm)")
+                return cached.decode("utf-8", "replace")
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise LLMError(f"no response within {budget:.0f}s")
@@ -202,6 +235,11 @@ class LLM:
             text = (msg.get("reasoning_content") or "")[-600:]
         if not text:
             raise LLMError("returned no content")
+        # Published only here: everything above this line is a failure that
+        # must stay unpublished, or one bad moment decides every later run.
+        lookups.put(lookups.LLM_STORE, ckey, "llm", ep.base_url,
+                    text.encode("utf-8"), lookups.lookup_ttl("llm"),
+                    self.log)
         return text
 
     def chat_json(self, system: str, user: str, max_tokens: int = 1500) \

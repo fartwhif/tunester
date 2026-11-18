@@ -89,19 +89,24 @@ NZBs), because the original album is the canonical source; direct search hits
 are the fallback. Archive RAR/par2 releases are fetched whole, repaired and
 extracted (`unar`, `par2`) before the track is plucked.
 
-## Reuse store
+## Caches
 
-Nothing is fetched, verified or encoded twice. Every file that passes the QC
-gate and every finished MP3 is copied into a cache (`TUNESTER_CACHE`, the
-container's `tunester-cache` volume — deliberately *not* under the output
-dir, so `downloads/` stays nothing but delivered files), keyed two ways:
+Nothing is fetched, verified or encoded twice. Five stores live under
+`TUNESTER_CACHE` (the container's `tunester-cache` volume — deliberately
+*not* under the output dir, so `downloads/` stays nothing but delivered
+files):
 
-- **source entries** — source URL + fetched file name. A hit skips the NNTP
-  pull or HTTP fetch; the copy is ffprobe-checked and then runs the whole QC
-  gate again, so a damaged entry costs a re-download, never a bad delivery.
+- **source entries** (`sources/`) — source URL + fetched file name, written
+  the moment a fetch succeeds, *before* any gate has judged it: the fetch (an
+  NNTP multi-part pull, an yt-dlp run, an archive.org GET) is the slow,
+  quota-spending part of a run, so a candidate that dies at the duration
+  anchor or the version gate costs the next tune the same minutes unless its
+  bytes are kept. A hit skips the NNTP pull or HTTP fetch; the copy is
+  ffprobe-checked and then runs the whole QC gate again, so a damaged entry —
+  or a rejected one — costs a fast re-judgement, never a bad delivery.
   A whole-release pluck hits on the plucked track's own cached file instead of
   re-fetching the entire RAR set.
-- **delivery entries** — normalized artist + title, the identity the gates
+- **delivery entries** (`deliveries/`) — normalized artist + title, the identity the gates
   actually verified. A hit skips the search, the fetch, the gates and the
   transcode: the song was already found and verified once, so the stored
   copy is handed back after one output-spec re-check, a duration
@@ -115,15 +120,50 @@ dir, so `downloads/` stays nothing but delivered files), keyed two ways:
   out under the stored entry's own name (its year included), so a
   recording the store already served never lands a second time under a
   second year.
+- **API answers** (`lookups/`) — every MusicBrainz, AcoustID, nzb.life search,
+  archive.org search/metadata and yt-dlp **search-listing** reply, keyed by the
+  question that produced it (the request URL, the fingerprint + duration, the
+  endpoint base + model id + `max_tokens` + the system and user prompt) and
+  TTL'd by class: reference answers (MusicBrainz, AcoustID — they change on a
+  yearly scale) live `TUNESTER_LOOKUP_TTL_HOURS` (72), catalog listings
+  `TUNESTER_SEARCH_TTL_MINUTES` (60), LLM verdicts `TUNESTER_LLM_TTL_HOURS` (168);
+  each knob at `0` turns that class's store off entirely. An LLM answer is keyed
+  that way — the api key is NOT in it — so a re-tune re-reads the verdict that
+  pinned the target and the gate verdicts every earlier candidate instead of paying
+  the GPU (and its nondeterminism) again, a rotated api key keeps its verdicts, and
+  a model swap moves to a different key instead of inheriting another model's call.
+  Only success is published: a `queued` AcoustID answer, an HTTP 4xx/5xx, a transient
+  nzb.life 5xx and a failed LLM call all leave nothing behind, so one bad moment
+  never decides a later run's verdicts. The MusicBrainz reply cache replaces the
+  1 req/s spacing gate on a hit — a hit is no request at all, so it short-circuits
+  *before* the sleep. A yt-dlp **media** download is never cached here (it is the
+  fetch, and its bytes go to `sources/`); `--no-llm` skips the LLM path (and so
+  its store) outright.
+- **NNTP sidecar text** (`nzb-text/`) — a release's tracklist/nfo, keyed by the
+  group plus the exact message-ids of the parts pulled, i.e. the Usenet articles
+  themselves, which are immutable once posted, so these carry **no expiry** (they
+  follow the reference kill switch). The compilation scan's per-candidate
+  multi-part NNTP round-trip is paid once per release forever: a scan that re-runs
+  after every cached delivery fails on the duration gate still reads the same
+  tracklist with no fetch.
 
-`TUNESTER_CACHE_MAX_MB` (30 GB) caps both stores; the least-recently-used
-entries are evicted first and a hit counts as use. Nothing about the cache
-can fail a tune: an unwritable directory or a corrupt entry degrades to
-fetching and verifying normally. `--seed-cache` indexes an existing
-`downloads/` into the store so songs already delivered never need
-fetching; a seeded file must parse as a delivery name, pass the output
-spec, and survive the fingerprint check (a file whose audio is a
-different song or a live take is not seeded).
+All five subtrees share the one `<sha1>.bin` + `<sha1>.json` layout and the one
+`TUNESTER_CACHE_MAX_MB` (30 GB) LRU cap — `pipeline._cache_evict` walks every
+`*.bin` under the root, so the KB-sized answers count against it too and are
+dropped oldest-use first along with the audio (a hit refreshes an entry's mtime,
+so what is used survives). The JSON stores deliberately carry **no 1 KB floor**:
+`{"results":[]}` is a few hundred bytes and an empty result list *is* a verdict
+worth keeping, unlike a truncated media blob. Nothing about the cache can fail a
+tune: an unwritable directory or a corrupt entry degrades to fetching and
+verifying normally. `--no-cache` skips the reuse stores — source bytes,
+deliveries and, via `lookups.enabled_scope(False)`, every answer store — for one
+run. `TUNESTER_NZB_CACHE` is separate from both and always honoured: it is a
+per-release XML manifest (a release's file list), never the song's audio, and the
+final cached-manifest sweep reads it because *which releases exist on disk* is the
+question it answers. `--seed-cache` indexes an existing `downloads/` into the
+store so songs already delivered never need fetching; a seeded file must parse as
+a delivery name, pass the output spec, and survive the fingerprint check (a file
+whose audio is a different song or a live take is not seeded).
 
 ## CLI
 
@@ -187,14 +227,17 @@ to start — missing optional settings simply disable their feature.
 | `TUNESTER_LLM_TIMEOUT` / `_LOAD_WAIT` / `_FAILOVER_WAIT` / `_THINK_BUDGET` | `240` / `360` / `90` / `100` | per-request timeout, cold-start wait allowed for the last endpoint, budget for a hung non-final one, thinking-token budget |
 | `TUNESTER_ACOUSTID_KEY` | unset | enables the AcoustID content gate (free key at acoustid.org; needs `fpcalc`, shipped in the image); the gate also re-verifies every reuse-store hit and every `--seed-cache` file. `TUNESTER_ACOUSTID_MIN_CONF` (0.7) is the score at which a confident identification of a *different* recording — or of a live take of the target — rejects. `TUNESTER_ACOUSTID_REQUIRE` (1) decides whether zero coverage rejects when MusicBrainz catalogues the target; `=0` downgrades it to a warning |
 | `TUNESTER_OUTDIR` | `./downloads` | output directory (the container uses `/data`) |
-| `TUNESTER_CACHE` | `$XDG_CACHE_HOME/tunester` | reuse store root (`$HOME/.cache/tunester` when XDG is unset); the container uses the `tunester-cache` volume at `/cache` |
-| `TUNESTER_CACHE_MAX_MB` | `30720` | cap on the reuse store; LRU entries are evicted first (a hit counts as use) |
+| `TUNESTER_CACHE` | `$XDG_CACHE_HOME/tunester` | cache root for every store: fetched source bytes, finished MP3s, API answers, NNTP sidecar text (`$HOME/.cache/tunester` when XDG is unset); the container uses the `tunester-cache` volume at `/cache` |
+| `TUNESTER_CACHE_MAX_MB` | `30720` | cap on the whole cache root; LRU entries are evicted first (a hit counts as use) |
+| `TUNESTER_LOOKUP_TTL_HOURS` | `72` | how long a cached MusicBrainz / AcoustID / archive.org-metadata answer stays good; `0` turns the answer store off (live calls every time) |
+| `TUNESTER_SEARCH_TTL_MINUTES` | `60` | how long a cached nzb.life / archive.org / yt-dlp **listing** stays good; `0` turns that store off |
+| `TUNESTER_LLM_TTL_HOURS` | `168` | how long a cached model verdict (discovery pin, version gate) stays good; `0` turns the LLM store off. Keyed by endpoint + model id + prompt, so a model swap never reuses another model's answer |
 | `TUNESTER_WEB_HOST` / `TUNESTER_WEB_PORT` | `0.0.0.0` / `8102` | `--serve` bind |
 | `TUNESTER_TRIALS` | `5` | candidates tried per source |
 | `TUNESTER_SEARCH_DEPTH` | `15` | results requested per yt-dlp query (SoundCloud; nzb.life/archive.org have their own fixed result windows) |
 | `TUNESTER_SEARCH_TIMEOUT`, `TUNESTER_HTTP_TIMEOUT`, `TUNESTER_DOWNLOAD_TIMEOUT` | `120` / `60` / `900` | per-operation budgets (s) |
 | `TUNESTER_NZB_MAX_ARCHIVE_MB` | `1024` | cap on fetching a whole RAR/zip release for the archive pluck |
-| `TUNESTER_NZB_CACHE` | `/data/.nzb-cache` | downloaded NZB manifests/releases (avoids repeat API pulls per release) |
+| `TUNESTER_NZB_CACHE` | `/data/.nzb-cache` | downloaded NZB manifests/releases (avoids repeat API pulls per release, and feeds the final cached-manifest sweep) |
 | `TUNESTER_FFMPEG` / `TUNESTER_FFPROBE` / `TUNESTER_YTDLP` | `ffmpeg` / `ffprobe` / `yt-dlp` | external binaries |
 | `WG_*` | see `.env.example` | WireGuard mesh tunnel (same template as the sibling services); unset → the entrypoint skips the tunnel |
 

@@ -19,6 +19,8 @@ from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from pathlib import Path
 
+import lookups
+
 YTDLP = os.environ.get("TUNESTER_YTDLP", "yt-dlp")
 SEARCH_DEPTH = int(os.environ.get("TUNESTER_SEARCH_DEPTH", "15"))
 SEARCH_TIMEOUT = int(os.environ.get("TUNESTER_SEARCH_TIMEOUT", "120"))
@@ -197,19 +199,47 @@ def _score(cand: Candidate, artist: str) -> None:
     cand.score = s
 
 
-def _yt_search(kind: str, artist: str, title: str, cookies: Path | None) -> list[Candidate]:
+def _yt_search(kind: str, artist: str, title: str, cookies: Path | None,
+               log=print) -> list[Candidate]:
     depth = SEARCH_DEPTH * (3 if kind == "ytsearch_loose" else 1)
     prefix = "ytsearch" if kind.startswith("yt") else "scsearch"
     cmd = [YTDLP, f"{prefix}{depth}:{artist} {title}",
            "--flat-playlist", "--dump-json", "--no-warnings"]
+    cookie_state = ""
     if kind.startswith("yt") and cookies and cookies.exists():
         cmd += ["--cookies", str(cookies)]
         ua = browser_user_agent()
         if ua:
             cmd += ["--user-agent", ua]
-    proc = subprocess.run(cmd, capture_output=True, timeout=SEARCH_TIMEOUT)
+        # The listing IS a function of the session (YouTube personalises and
+        # rate-limits by cookie), so the cookie's own freshness belongs in
+        # the answer's identity: a rotated jar refreshes the store instead
+        # of serving a week-old ranking that a dead session produced.
+        try:
+            cookie_state = str(int(cookies.stat().st_mtime))
+        except OSError:
+            cookie_state = "?"
+    # A flat-playlist listing is yt-dlp's slow round-trip (seconds to tens
+    # of seconds per source) and the SAME query reappears on every re-tune
+    # of a song. Cache the RAW stdout, never the parsed candidates: parsing
+    # is cheap, and the ranking filters must keep running per run (the
+    # target's year/album decide which upload wins).
+    qkey = ("ytdlp", prefix, depth, f"{artist} {title}", cookie_state)
+
+    def fetch() -> bytes | None:
+        proc = subprocess.run(cmd, capture_output=True,
+                              timeout=SEARCH_TIMEOUT)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            # A non-zero yt-dlp (age-gated video, dead session, rate limit)
+            # is a FAILED listing, not an empty one; publishing the empty
+            # body would freeze "no such uploads" for the whole TTL.
+            return None
+        return proc.stdout
+
+    _hit, out = lookups.cached("search", qkey, fetch, log,
+                               source=f"ytsearch {artist} {title}")
     cands: list[Candidate] = []
-    for line in proc.stdout.decode(errors="replace").splitlines():
+    for line in (out or b"").decode(errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -282,6 +312,37 @@ _RADIO_CREATOR = re.compile(
     r"(?i)\bradio\b|\bfm\b|\bdj\b|on ?air|airwaves|pop defect|prog ?rock")
 
 
+def _cached_json(url: str, kind: str, log, tries: int = 1) -> dict | None:
+    """GET one archive.org JSON endpoint through the answer store.
+
+    `kind` decides the expiry: an advancedsearch page is a LISTING (new
+    uploads appear, so it goes stale in minutes) while an item's metadata is
+    a REFERENCE answer (its file list changes only when someone adds files).
+    The metadata call is the expensive half of an archive search - one GET
+    per candidate item, up to 15 per query - and a re-tune of the same song
+    asks for the same items. A failure publishes nothing, exactly like every
+    other wrapper here."""
+    def fetch() -> bytes | None:
+        for a in range(max(1, tries)):
+            try:
+                with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as resp:
+                    return resp.read()
+            except Exception:
+                if a + 1 < max(1, tries):
+                    time.sleep(2.0 * (a + 1))
+        return None
+
+    _hit, body = lookups.cached(kind, ("ao", url), fetch, log, source=url)
+    if body is None:
+        return None
+    try:
+        return json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        log(f"      archive.org reply was not JSON: {url[:70]}")
+        lookups.drop_key(lookups.API_STORE, ("ao", url))
+        return None
+
+
 def _archive_is_live_item(ident: str, title: str, creator: str,
                           artist_words: set[str]) -> bool:
     """True if the archive.org ITEM is a concert/soundboard/radio source.
@@ -310,7 +371,8 @@ def _archive_is_live_item(ident: str, title: str, creator: str,
     return False
 
 
-def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]:
+def _archive_search(artist: str, title: str, album: str = "",
+                    log=print) -> list[Candidate]:
     """Audio items first; full-album uploads rarely mention individual
     track names in item metadata, so the album query lets the per-file
     title filter pluck the track. Video items (official music videos)
@@ -330,10 +392,8 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
     for q in queries:
         url = ("https://archive.org/advancedsearch.php?"
                f"q={urllib.parse.quote(q)}&fl%5B%5D=identifier&rows=25&output=json")
-        try:
-            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as resp:
-                data = json.load(resp)
-        except Exception:
+        data = _cached_json(url, "search", log)
+        if data is None:
             continue
         docs = (data.get("response") or {}).get("docs") or []
         if not docs:
@@ -342,12 +402,9 @@ def _archive_search(artist: str, title: str, album: str = "") -> list[Candidate]
             ident = d.get("identifier")
             if not ident:
                 continue
-            try:
-                with urllib.request.urlopen(
-                        f"https://archive.org/metadata/{ident}",
-                        timeout=HTTP_TIMEOUT) as resp:
-                    meta = json.load(resp)
-            except Exception:
+            meta = _cached_json(f"https://archive.org/metadata/{ident}",
+                                "reference", log)
+            if meta is None:
                 continue
             md = meta.get("metadata") or {}
             uploader = str(md.get("creator") or md.get("creator__sort") or "")
@@ -417,35 +474,60 @@ def _query_text(s: str) -> str:
     return s.replace("'", "").replace("\u2019", "")
 
 
-def _nzb_search(artist: str, title: str, year: str = "") -> list[Candidate]:
+def _nzb_search(artist: str, title: str, year: str = "",
+                log=print) -> list[Candidate]:
     """Newznab search on nzb.life, audio only (cat 3000). The original
     release year is a relevance hint: scene titles carry the pressing
     year, so it keeps the original ahead of reissue/remaster packs.
     nzb.life ANDs free-text terms, so when no release title carries the
     year the yeared query returns nothing - fall back to the bare query
     (searches cost nothing; only getnzb fetches a manifest)."""
-    cands = _nzb_query(f"{artist} {title}" + (f" {year}" if year else ""))
+    cands = _nzb_query(f"{artist} {title}" + (f" {year}" if year else ""),
+                       log=log)
     if not cands and year:
-        cands = _nzb_query(f"{artist} {title}")
+        cands = _nzb_query(f"{artist} {title}", log=log)
     return cands
 
 
-def _nzb_query(q: str, pages: int = 1) -> list[Candidate]:
+def _nzb_query(q: str, pages: int = 1, log=print) -> list[Candidate]:
     """Newznab audio search (cat 3000). The server caps every page at
     100 items (t=caps: max=100), so an artist-only browse of a prolific
     artist (313 releases for 'The Crystal Method') needs explicit
     paging: `pages` fetches offsets 0/100/200/... and stops early on a
     short page. The default single page keeps the normal artist+title
-    search at its old single-request cost."""
+    search at its old single-request cost.
+
+    Each page is cached on its own (query, page, host, api key - never the
+    apikey's VALUE in the log line, but it IS in the key so a key rotation
+    that changes the account's quota does not serve another account's
+    ranking). nzb.life's WAF rate-limits aggressively and a compile scan
+    re-runs the same artist browse on every tune that gets to that layer, so
+    the listing TTL keeps the browse off the API for an hour."""
     cands: list[Candidate] = []
     for off in range(0, max(1, pages) * 100, 100):
         params = {"apikey": NZB_APIKEY, "t": "search", "q": _query_text(q),
                   "cat": "3000"}
         if off:
             params["offset"] = off
-        xml = _nzb_get(f"{NZB_API}/api?"
-                       + urllib.parse.urlencode(params),
-                       SEARCH_TIMEOUT).decode("utf-8", "replace")
+        api_url = f"{NZB_API}/api?" + urllib.parse.urlencode(
+            {k: v for k, v in params.items()})
+
+        def fetch(u: str = api_url) -> bytes | None:
+            try:
+                return _nzb_get(u, SEARCH_TIMEOUT)
+            except Exception as e:
+                # A 429 cooldown / WAF block is nzb.life NOT answering; a
+                # zero-item page is not a "no releases" verdict, so nothing
+                # is published.
+                log(f"      nzb.life search failed: {e}")
+                return None
+
+        _hit, got = lookups.cached(
+            "search", ("nzb-search", NZB_API, api_url), fetch, log,
+            source=f"{NZB_API}/api?t=search&q={_query_text(q)}&offset={off}")
+        if got is None:
+            break
+        xml = got.decode("utf-8", "replace")
         items = re.findall(r"<item>.*?</item>", xml, re.S)
         for item in items:
             tm = re.search(r"<title>(.*?)</title>", item, re.S)
@@ -472,25 +554,25 @@ def _nzb_query(q: str, pages: int = 1) -> list[Candidate]:
     return cands
 
 
-def nzb_artist_releases(artist: str) -> list[Candidate]:
+def nzb_artist_releases(artist: str, log=print) -> list[Candidate]:
     """Every nzb.life audio release whose TITLE carries the artist name:
     the artist-credited albums AND the artist-titled comp/best-of boxes
     that no artist+album or artist+title query can reach (the comp title
     names neither the song nor the album - 'The Crystal Method - The
     Best Of + Vegas + Tweekend'). Paged past the 100-item page limit;
     the pipeline judges each by its NZB manifest, never by the title."""
-    return _nzb_query(artist, pages=NZB_ARTIST_PAGES)
+    return _nzb_query(artist, pages=NZB_ARTIST_PAGES, log=log)
 
 
 def search_candidates(source: Source, artist: str, title: str,
                       cookies: Path | None, year: str = "",
-                      album: str = "") -> list[Candidate]:
+                      album: str = "", log=print) -> list[Candidate]:
     if source.kind == "archive":
-        cands = _archive_search(artist, title, album)
+        cands = _archive_search(artist, title, album, log)
     elif source.kind == "nzb":
-        cands = _nzb_search(artist, title, year)
+        cands = _nzb_search(artist, title, year, log)
     else:
-        cands = _yt_search(source.kind, artist, title, cookies)
+        cands = _yt_search(source.kind, artist, title, cookies, log)
     seen: set[str] = set()
     out: list[Candidate] = []
     for c in cands:

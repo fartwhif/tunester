@@ -25,9 +25,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 
+import lookups
 from llm import LLM, LLMError
 from sources import (BROWSER_UA, HTTP_TIMEOUT, NNTP_HOST, NNTP_PASS,
                      NNTP_PORT, NNTP_USER, NZB_API, NZB_APIKEY, NZB_I,
@@ -876,34 +876,57 @@ _MB_LAST = [0.0]               # wall time of the previous MB request
 
 def _mb_get(path: str, log) -> dict | None:
     """One MusicBrainz Web Service call (JSON); None on any failure.
-    Spaced >= MB_MIN_INTERVAL apart (discover chains an album + cd_year +
-    duration lookup per tune and more across sources; firing them
-    back-to-back self-inflicts a 429 that empties the album backfill and
-    silently reverts to title-only search) and retried with backoff, so
-    the studio-album anchor survives."""
+    Served from the answer cache when this box has asked for the same URL
+    inside the reference TTL - one tune chains an album + cd_year + duration
+    lookup and, per candidate, a recording query, so a re-tune of a song a
+    GrabbyTube batch already asked about used to pay the API latency AND the
+    per-IP rate budget again for identical bytes.
+
+    A live entry short-circuits BEFORE the spacing gate: the interval exists
+    to keep real requests off MusicBrainz's 1 req/s budget, and a cache hit
+    is no request at all. Only a miss runs the spaced, retried fetch."""
     url = f"{MB_BASE}{path}"
-    for attempt in range(4):
-        with _MB_LOCK:
-            wait = MB_MIN_INTERVAL - (time.time() - _MB_LAST[0])
-            if wait > 0:
-                time.sleep(wait)
-            _MB_LAST[0] = time.time()
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": MB_UA,
-                              "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                return json.loads(r.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and attempt + 1 < 4:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            log(f"      musicbrainz: HTTP {e.code}")
-            return None
-        except Exception as e:
-            log(f"      musicbrainz unreachable: {e.__class__.__name__}")
-            return None
-    return None
+
+    def fetch() -> bytes | None:
+        for attempt in range(4):
+            with _MB_LOCK:
+                wait = MB_MIN_INTERVAL - (time.time() - _MB_LAST[0])
+                if wait > 0:
+                    time.sleep(wait)
+                _MB_LAST[0] = time.time()
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": MB_UA,
+                                  "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return r.read()
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and attempt + 1 < 4:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                log(f"      musicbrainz: HTTP {e.code}")
+                return None
+            except Exception as e:
+                log(f"      musicbrainz unreachable: "
+                    f"{e.__class__.__name__}")
+                return None
+        return None
+
+    hit, body = lookups.cached("reference", ("mb", url), fetch, log,
+                               source=url)
+    if body is None:
+        return None
+    try:
+        parsed = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        # A hit that will not parse is a damaged entry, not an answer; a
+        # fresh body that will not parse is a broken server. Either way the
+        # entry is dropped so the NEXT call re-fetches instead of trusting
+        # the same bytes forever.
+        log("      musicbrainz: reply was not JSON")
+        lookups.drop(lookups.API_STORE, lookups.key("mb", url))
+        return None
+    return parsed
 
 
 # MusicBrainz matches its `artist:` clause against the CREDIT TEXT stored
@@ -1546,11 +1569,13 @@ def _cache_put(path: Path, url: str, name: str, log) -> None:
 
 def _cache_evict(log) -> None:
     """Keep the cache under TUNESTER_CACHE_MAX_MB (default 30 GB), dropping
-    the least-recently-used entries first. Both subtrees count against the
-    cap and a hit refreshes an entry's mtime, so what is used survives.
-    Source files are big (a FLAC album pluck is tens to hundreds of MB), so
-    an unbounded store would eventually cost more than the fetches it
-    saves."""
+    the least-recently-used entries first. EVERY subtree counts against the cap -
+    the source blobs, the finished MP3s, and the three answer stores `lookups.py`
+    writes (`lookups/`, `nzb-text/`, `llm/`), since this walks `*.bin` under the
+    whole cache root - and a hit refreshes an entry's mtime, so what is used
+    survives. Source files are big (a FLAC album pluck is tens to hundreds of MB),
+    so an unbounded store would eventually cost more than the fetches it saves;
+    the KB-sized answers occupy only the margin the media leaves."""
     try:
         entries = {b: [b, b.with_suffix(".json")]
                    for b in CACHE_DEFAULT.rglob("*.bin")}
@@ -1660,7 +1685,7 @@ def _delivery_get(target: Target, outdir: Path,
     # entry may have entered the store through --seed-cache from a library
     # file that was never fingerprint-checked, and a rule that only gated
     # fresh downloads would serve such an entry forever.
-    ident = _acoustid_identify(part, target)
+    ident = _acoustid_identify(part, target, log)
     if ident is not None:
         objection = _acoustid_objection(ident, target, target.mb_duration)
         if objection:
@@ -1736,7 +1761,7 @@ def seed_cache(outdir: Path, log=print) -> tuple[int, int, int]:
             skipped += 1
             log(f"  skip {f.name}: " + "; ".join(problems))
             continue
-        ident = _acoustid_identify(f, target)
+        ident = _acoustid_identify(f, target, log)
         if ident is not None:
             objection = _acoustid_objection(ident, target, 0.0)
             if objection:
@@ -1762,16 +1787,28 @@ def download(cand: Candidate, tmp: Path, cookies: Path | None,
     """Fetch a candidate into tmp (served from the download cache when it holds
     this source); return (file path, file name) or None. The file name is the
     per-file name the QC gate judges on a multi-track release, and is also the
-    name part of the cache identity for that source."""
+    name part of the cache identity for that source.
+
+    A successful fetch is published to the source store HERE, before any gate
+    has judged it - the fetch (an NNTP multi-part pull, an yt-dlp run, an
+    archive.org GET) is the slow, quota-spending part of a run, and a
+    candidate that dies at the length anchor or the version gate costs the
+    NEXT tune the same minutes unless its bytes are kept. Verification still
+    runs on every hit (`_cache_hit` ffprobes the hydrated copy and the caller
+    re-runs the full gate chain), so storing a rejected file only ever buys a
+    fast second rejection; it never changes what gets delivered."""
     if cand.source == "archive":
         name = _archive_file_name(cand)
         got = _download_http(cand, tmp, log, name, use_cache)
-        return (got, name) if got else None
-    if cand.source == "nzb":
-        return _download_nzb(cand, tmp, target, log, use_cache)
-    got = _download_yt(cand, tmp, cookies, log, use_cache)
-    return (got, "") if got else None
-
+        out = (got, name) if got else None
+    elif cand.source == "nzb":
+        out = _download_nzb(cand, tmp, target, log, use_cache)
+    else:
+        got = _download_yt(cand, tmp, cookies, log, use_cache)
+        out = (got, "") if got else None
+    if out is not None and use_cache:
+        _cache_put(out[0], cand.url, out[1], log)
+    return out
 
 def _download_yt(cand: Candidate, tmp: Path, cookies: Path | None, log,
                  use_cache: bool = True) -> Path | None:
@@ -2264,7 +2301,8 @@ def _nzb_album_cands(target: Target, seen: set[str],
     for name in names:
         try:
             got = search_candidates(src, name, target.album, None,
-                                    year=target.year, album=target.album)
+                                    year=target.year, album=target.album,
+                                    log=log)
         except Exception as e:
             log(f"      album search failed: {e}")
             continue
@@ -2354,11 +2392,19 @@ def _sidecar_track(text: str, target: Target) -> int:
     return 0
 
 
-def _nzb_sidecar_text(files, log) -> str | None:
+def _nzb_sidecar_text(files, log, url: str = "") -> str | None:
     """Fetch and decode the smallest small text sidecar (tracklist / nfo)
     of a release that has no media file naming the song, over NNTP - a
     single file, so a 120 MB hash-volume box costs a few KB here. None when
-    the release has no fetchable sidecar (or the fetch fails)."""
+    the release has no fetchable sidecar (or the fetch fails).
+
+    Served from the `nzb-text` store on a repeat: the identity is the GROUP
+    plus the exact message-ids of the parts that were pulled, i.e. the
+    Usenet articles themselves, which are immutable once posted. These
+    entries carry NO expiry (`lookup_ttl("text")`), so the multi-part NNTP
+    round-trip a compilation scan pays per candidate is paid once per
+    release forever - a scan that re-runs after every cached delivery fails
+    on the duration gate still reads the same tracklist without a fetch."""
     sides = []
     for subj, grp, segs in files:
         name = _nzb_file_name(subj)
@@ -2370,37 +2416,51 @@ def _nzb_sidecar_text(files, log) -> str | None:
             sides.append((len(segs), size, name, grp, segs))
     if not sides:
         return None
-    _n, _sz, name, grp, segs = min(sides, key=lambda s: (s[0], s[1]))
-    log(f"        reading tracklist {name!r} ({len(segs)} part(s))")
-    try:
-        import nntplib  # stdlib; absent from Python 3.14+ hosts
-        conn = nntplib.NNTP_SSL(NNTP_HOST, NNTP_PORT, user=NNTP_USER,
-                                password=NNTP_PASS, timeout=30)
-    except Exception as e:
-        log(f"        sidecar NNTP connect failed: {e}")
-        return None
-    blob = b""
-    try:
-        if grp:
+    # Message-ids ARE the answer's identity: the same posting yields the
+    # same articles, so a re-run reads the same bytes. `url` (the nzb.life
+    # release id) goes into the sidecar's provenance, not the key, so the
+    # text also serves when the same posting is reached from another query.
+    qkey = ("nzbtext", grp or "", *[m for m, _ in sorted(
+        (mid, _e) for mid, _e in segs)])
+
+    def fetch() -> bytes | None:
+        log(f"        reading tracklist {name!r} ({len(segs)} part(s))")
+        try:
+            import nntplib  # stdlib; absent from Python 3.14+ hosts
+            conn = nntplib.NNTP_SSL(NNTP_HOST, NNTP_PORT, user=NNTP_USER,
+                                    password=NNTP_PASS, timeout=30)
+        except Exception as e:
+            log(f"        sidecar NNTP connect failed: {e}")
+            return None
+        blob = b""
+        try:
+            if grp:
+                try:
+                    conn.group(grp)
+                except Exception:
+                    pass
+            for mid, _enc in segs:
+                try:
+                    _resp, info = conn.body(f"<{mid}>")
+                except Exception:
+                    log(f"        sidecar part fetch failed: {name}")
+                    return None
+                part = _yenc_part(info.lines)
+                if part is None:
+                    return None
+                blob += part
+        finally:
             try:
-                conn.group(grp)
+                conn.quit()
             except Exception:
                 pass
-        for mid, _enc in segs:
-            try:
-                _resp, info = conn.body(f"<{mid}>")
-            except Exception:
-                log(f"        sidecar part fetch failed: {name}")
-                return None
-            part = _yenc_part(info.lines)
-            if part is None:
-                return None
-            blob += part
-    finally:
-        try:
-            conn.quit()
-        except Exception:
-            pass
+        return blob
+
+    hit, blob = lookups.cached("text", qkey, fetch, log,
+                               source=url or f"grp:{grp}",
+                               sub=lookups.TEXT_STORE)
+    if blob is None:
+        return None
     for enc in ("utf-8", "cp437", "latin-1"):
         try:
             return blob.decode(enc)
@@ -2433,7 +2493,7 @@ def _nzb_comp_cands(target: Target, tried: set[str], log) -> list[Candidate]:
     reads (cached after the first run) and never re-touches a release already
     tried this run."""
     try:
-        browsed = nzb_artist_releases(target.artist)
+        browsed = nzb_artist_releases(target.artist, log)
     except Exception as e:
         log(f"      comp scan: artist browse failed: {e}")
         return []
@@ -2485,7 +2545,7 @@ def _nzb_comp_cands(target: Target, tried: set[str], log) -> list[Candidate]:
         files = _nzb_release_files(manifest)
         if not files:
             continue
-        text = _nzb_sidecar_text(files, log)
+        text = _nzb_sidecar_text(files, log, c.url)
         if text:
             for line in text.splitlines():
                 if _sidecar_track(line, target):
@@ -2922,18 +2982,22 @@ def _year_mismatch(title: str, year: str) -> bool:
     return False
 
 
-@lru_cache(maxsize=4)
-def _consensus_duration(artist: str, title: str) -> float | None:
+def _consensus_duration(artist: str, title: str, log) -> float | None:
     """Duration the other sources most agree on for this song
     (previews excluded); None when no sources agree. The canonical
     version is the length most uploads share, not the overall
-    median - remixes and edits can dominate a search."""
+    median - remixes and edits can dominate a search.
+
+    No in-process memo any more: this is exactly what the answer store is
+    for. The listings it reads are cached per source on the same artist +
+    title query `tune` already ran, so a re-tune pays a store read per
+    source instead of a yt-dlp run, and the memo survives the process."""
     durs = []
     for src in SOURCES:
         if src.kind == "nzb":
             continue
         try:
-            for c in search_candidates(src, artist, title, None):
+            for c in search_candidates(src, artist, title, None, log=log):
                 if c.duration and c.duration > 45:
                     durs.append(float(c.duration))
         except Exception:
@@ -2975,7 +3039,7 @@ def _fingerprint(path: Path) -> tuple[str, int] | None:
     return fp, dur
 
 
-def _acoustid_lookup(fp: str, dur: int) -> list[dict] | None:
+def _acoustid_lookup(fp: str, dur: int, log) -> list[dict] | None:
     """AcoustID v2 result clusters for one fingerprint: the cluster list
     (possibly empty) on a real answer, or None when the SERVICE did not
     answer - bad key, timeout, malformed reply, or a 'queued' / rate-limited
@@ -2983,32 +3047,54 @@ def _acoustid_lookup(fp: str, dur: int) -> list[dict] | None:
     point: an empty list means "nobody has ever submitted these bytes"
     (content evidence against the file); None means "we do not know", and
     a flaky service must never condemn - or rescue - a file."""
-    body = urllib.parse.urlencode({
-        "client": ACOUSTID_KEY, "fingerprint": fp, "duration": str(dur),
-        "meta": "recordings", "format": "json"})
-    for attempt in range(4):
-        try:
-            req = urllib.request.Request(
-                f"https://{ACOUSTID_HOST}/v2/lookup",
-                data=body.encode("utf-8"),
-                headers={"User-Agent": BROWSER_UA,
-                         "Content-Type": "application/x-www-form-urlencoded"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                d = json.load(r)
-        except Exception:
-            time.sleep(2.0 * (attempt + 1))
-            continue
-        status = d.get("status")
-        if status == "ok":
-            return d.get("results") or []
-        if status in ("queued", "out of service", None):
-            # 'queued' is AcoustID's under-load answer; the audit run saw
-            # it repeatedly and every blind reading of it as "no results"
-            # would drop a perfectly good cached delivery.
-            time.sleep(3.0 * (attempt + 1))
-            continue
-        return None  # error status (bad key etc.): treat as service failure
-    return None
+    # The fingerprint + duration IS the question; the `client` key only
+    # spends quota, so it stays out of the identity (a key rotation must not
+    # invalidate every answer already stored). An EMPTY cluster list is a
+    # real verdict - "nobody has ever submitted these bytes" - and is cached
+    # like any other, because that is the content evidence a re-tune would
+    # otherwise pay the API all over again to re-derive.
+    qkey = ("acoustid", ACOUSTID_HOST, fp, str(dur))
+
+    def fetch() -> bytes | None:
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(
+                    f"https://{ACOUSTID_HOST}/v2/lookup",
+                    data=body.encode("utf-8"),
+                    headers={"User-Agent": BROWSER_UA,
+                             "Content-Type":
+                             "application/x-www-form-urlencoded"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    d = json.load(r)
+            except Exception:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            status = d.get("status")
+            if status == "ok":
+                # ONLY an ok answer is publishable. 'queued' is AcoustID's
+                # under-load answer (the audit run saw it repeatedly); a
+                # blind reading of it as "no results" would condemn a
+                # perfectly good file, and freezing it in the store would
+                # condemn every later run too. Nothing is cached until a
+                # retry actually gets status == "ok".
+                return json.dumps({"results": d.get("results") or []}
+                                  ).encode("utf-8")
+            if status in ("queued", "out of service", None):
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            return None  # error status (bad key etc.): service failure
+        return None
+
+    hit, payload = lookups.cached("reference", qkey, fetch, log,
+                                  source=f"https://{ACOUSTID_HOST}/v2/lookup")
+    if payload is None:
+        return None
+    try:
+        return json.loads(payload).get("results") or []
+    except (ValueError, AttributeError):
+        lookups.drop_key(lookups.API_STORE, qkey)
+        log("      acoustid: cached reply was not JSON - re-fetching")
+        return None
 
 
 def _live_marked(title: str, dis: str) -> bool:
@@ -3038,7 +3124,7 @@ def _acoustid_credit_names(x) -> list[str]:
     return []
 
 
-def _acoustid_identify(path: Path, target: Target) -> dict | None:
+def _acoustid_identify(path: Path, target: Target, log) -> dict | None:
     """Fingerprint `path` and ask AcoustID what it is. None when the check
     could not run (no key, fpcalc missing, service failure/queued) - the
     gate is SKIPPED then, never a verdict. Otherwise a verdict dict:
@@ -3070,7 +3156,7 @@ def _acoustid_identify(path: Path, target: Target) -> dict | None:
     got = _fingerprint(path)
     if got is None:
         return None
-    clusters = _acoustid_lookup(*got)
+    clusters = _acoustid_lookup(got[0], got[1], log)
     if clusters is None:
         return None
     best = 0.0
@@ -3234,7 +3320,7 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         why = "MusicBrainz"
     else:
         expect = target.mb_duration or _consensus_duration(
-            target.artist, target.title)
+            target.artist, target.title, log)
         why = "MusicBrainz/other sources"
     # Objective facts the LLM cannot see, recorded here for the version
     # veto below: whether the length agrees with the studio anchor, and
@@ -3245,7 +3331,7 @@ def verify_download(path: Path, cand: Candidate, target: Target,
         return False, "duration", (
             f"{info['duration']:.0f}s vs ~{expect:.0f}s per {why}")
     studio_confirmed = False
-    ident = _acoustid_identify(path, target)
+    ident = _acoustid_identify(path, target, log)
     if ident is None:
         log("        acoustid: unavailable - gate skipped")
     else:
@@ -3428,9 +3514,11 @@ def _try_candidates(cands, tmp: Path, cookies, target: Target, llm, opts,
             path.unlink(missing_ok=True)
             continue
         if opts.use_cache:
-            # Only what passed every gate is stored, so neither store
-            # ever accumulates previews or mislabeled junk.
-            _cache_put(path, cand.url, fname, log)
+            # The SOURCE bytes were already published by `download` at fetch
+            # time (that store keeps what was fetched, gates re-run on every
+            # hit); only the finished MP3 is stored here, because the
+            # delivery store is keyed by the TARGET - it answers "what did
+            # this song name resolve to", which no pre-gate fetch could know.
             _delivery_put(dst, target, cand.source, cand.url, log)
         out_info = probe(dst) or {}
         log(f"[5/5] done -> {dst}")
@@ -3446,6 +3534,14 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
     """Run the full pipeline. Returns a Result or raises TuneError."""
     opts = opts or Options()
     llm = llm if llm is not None else LLM(log=log)
+    # `--no-cache` covers the answer store too, not just the media blobs.
+    # The scope is context-local, so a web-server tune cannot switch off a
+    # sibling job's caching (see `lookups.enabled_scope`).
+    with lookups.enabled_scope(opts.use_cache):
+        return _tune(raw, opts, llm, log)
+
+
+def _tune(raw: str, opts: Options, llm: LLM, log) -> Result:
     cookies = find_cookies(opts.cookies)
 
     log(f"[1/5] discover: {raw!r}")
@@ -3496,7 +3592,7 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
             try:
                 cands = search_candidates(src, target.artist, target.title,
                                           cookies, year=target.year,
-                                          album=target.album)
+                                          album=target.album, log=log)
             except Exception as e:
                 log(f"      search failed: {e}")
                 continue

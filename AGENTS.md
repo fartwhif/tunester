@@ -7,13 +7,23 @@ orchestrates, `sources.py` searches, `llm.py` wraps the LLM chat APIs.
 ## Reuse store (2026-11-10)
 `TUNESTER_CACHE` (container: named volume `tunester-cache` at `/cache` —
 **not** under `/data`, so `downloads/` stays purely the user's delivered
-files) holds two subtrees, each `<sha1>.bin` + a `<sha1>.json` sidecar,
+files) holds the two media subtrees — `sources/` and `deliveries/`; three more,
+for the cached answers, are documented under "Answer stores" below — each
 written blob-then-sidecar via `os.replace` so no reader ever sees a partial
 entry (`_cache_write`):
 - `sources/` — key `sha1(source URL, fetched file name)` (URL alone for
-  archive.org/SoundCloud, where `name=""`). Skips the fetch; the hydrated
-  copy is ffprobe-checked and then runs the FULL gate + transcode again, so
-  the cache never changes what gets delivered. `_cache_release_hit` covers
+  archive.org/SoundCloud, where `name=""`). A hit skips the fetch.
+  **Published at FETCH time**
+  (`download()` calls `_cache_put` on every successful fetch, before any gate has
+  judged the file — 2026-11-18): the fetch is the slow, quota-spending part of a
+  run (an NNTP multi-part pull, an yt-dlp run, an archive.org GET), so a candidate
+  that dies at the duration anchor or the version gate used to cost the NEXT tune
+  the same minutes for the same bytes. `_cache_write` short-circuits on
+  `_blob_known`, so the later post-gate `_cache_put` is a no-op for the winner —
+  no double 300 MB copy. Verification still runs on every hit (`_cache_hit`
+  ffprobes the hydrated copy and the caller re-runs the FULL gate + transcode), so
+  storing a rejected file only ever buys a fast second rejection; the cache never
+  changes what gets delivered. `_cache_release_hit` covers
   whole-RAR plucks: it scans sidecars for this release URL + a name naming
   the target title at the same `_title_hit` tier the pluck would have used
   (see "Parenthetical-stripped tier" under Album pluck), so a different
@@ -52,11 +62,119 @@ entry (`_cache_write`):
   differently run to run (MB unreachable) — "I Wanna Dance with
   Somebody" vs "(Who Loves Me)", 2026-11-10 — is a separate entry
   and a second file.
-`--no-cache` = `Options.use_cache=False` skips reads AND writes in both
-stores. `_cache_evict` caps both subtrees at `TUNESTER_CACHE_MAX_MB`
-(default 30720) by entry mtime; a hit refreshes mtime so used entries
-survive. Every cache failure (unwritable dir, corrupt blob/sidecar, copy
+`--no-cache` = `Options.use_cache=False` skips reads AND writes in every store.
+`_cache_evict` caps the whole cache root — media blobs and answers alike — at
+`TUNESTER_CACHE_MAX_MB` (default 30720) by entry mtime; a hit refreshes mtime so
+used entries survive. Every cache failure (unwritable dir, corrupt blob/sidecar, copy
 error) logs and returns a miss — a cache problem NEVER fails a tune.
+
+## Answer stores: lookups.py (2026-11-18)
+
+`pipeline`'s two subtrees hold the megabytes. Everything else the tuner spends
+time on is a small, repeatable ANSWER, and until now every one of them was
+re-fetched per run: one tune chains an album + `cd_year` + duration lookup, plus
+a recording query per candidate and an AcoustID lookup per download, so re-tuning
+a song a GrabbyTube batch already asked about paid the API latency AND the per-IP
+rate budget again for identical bytes. `lookups.py` is a third store — same
+`<sha1>.bin` + `<sha1>.json` layout, same blob-then-sidecar `os.replace` publish,
+same shared LRU eviction (`_cache_evict` walks every `*.bin` under the cache root,
+so answers count against `TUNESTER_CACHE_MAX_MB` and are dropped oldest-use first
+along with the audio) — with ONE deliberate difference: **no 1 KB floor**. An API
+answer is often `{"results":[]}` (a few hundred bytes), and an empty result list
+IS a verdict worth keeping; `pipeline._blob_known`'s `st_size > 1024` test would
+read such an entry as absent, so `lookups.get` has its own rule.
+
+- `lookups/` — HTTP responses, keyed by the question: `("mb", url)`,
+  `("acoustid", host, fingerprint, duration)`,
+  `("nzb-search", api-host, full api URL incl. offset + apikey)`,
+  `("ao", url)` (archive.org `advancedsearch` listings at kind `search`,
+  `metadata/<identifier>` item records at kind `reference`), and
+  `("ytdlp", prefix, depth, "artist title", cookie-state)` for a yt-dlp
+  **search listing**. The nzb.life key carries the apikey VALUE (so a key rotation
+  that changes the account's quota cannot serve another account's ranking). The
+  archive.org metadata key is the **identifier**, not the query that found it, so
+  the expensive half of an archive search — one metadata GET per candidate item,
+  up to 15 per query, three queries — costs the API once per item for the whole
+  reference TTL no matter which query or which tune asks next.
+  The `("llm", …)` store is the next bullet.
+- `llm/` — model replies (the discovery pin, the QC version gate). The payload is
+  the **reply text**, not the HTTP envelope, and the key (`llm._chat_key`) is
+  `sha1(endpoint base, model id, max_tokens, system, user)`: `temperature 0` and
+  no streaming make the reply a function of those five alone, the **api key is
+  deliberately absent** (it authorizes a request, it does not change the answer,
+  and rotating it must not invalidate the verdicts it bought — same reasoning as
+  the AcoustID `client` key above), and the key is RE-DERIVED after a 404 model
+  substitution, so an entry never claims to be an answer from a model that never
+  produced it. The base URL is in the identity because an inference host answers an
+  id it does not serve by aliasing it to whatever it has loaded (this box's own
+  GPU peer does exactly that), so the same id on another host is a different model.
+  `pipeline.tune` wraps the whole run in `lookups.enabled_scope(opts.use_cache)`,
+  so `--no-llm` still caches (it never reaches `chat`) but `--no-cache` publishes
+  nothing — an LLM answer must not leak past the switch that exists to make a run
+  repeatable.
+- `nzb-text/` — NNTP tracklist/nfo sidecars, key `("nzbtext", group, *message-ids
+  sorted)`. Message-ids ARE the answer's identity: Usenet articles are immutable
+  once posted, so these carry **no expiry** (`kind="text"` → `lookup_ttl` returns
+  None) and the multi-part round-trip the compilation scan pays per candidate is
+  paid once per release forever. The nzb.life release URL goes in the sidecar's
+  `source` field, not the key, so the same posting also serves when reached from
+  another query.
+
+**TTL is per entry** (the sidecar records the TTL in force when it was written)
+and read from the environment per call: `TUNESTER_LOOKUP_TTL_HOURS` (72, reference
+answers — MusicBrainz, AcoustID, archive.org item metadata),
+`TUNESTER_SEARCH_TTL_MINUTES` (60, catalog listings), `TUNESTER_LLM_TTL_HOURS`
+(168, model verdicts). `0` = that class's store is OFF (neither read nor written),
+the kill switch for anyone needing live calls; `text` has no TTL of its own but
+follows the reference switch. An entry written under a *different* TTL than the
+one in force now is stale, so changing a knob refreshes the store rather than
+serving answers the new setting calls too old.
+
+**Only success is published** — this is the load-bearing rule, because freezing a
+service's bad moment would let it decide a later run's verdicts:
+- AcoustID publishes ONLY on `status == "ok"`. A `queued` / `out of service`
+  answer (the under-load reply the 2026-11-11 audit caught) retries and caches
+  nothing; `status == "error"` (bad key) publishes nothing. An EMPTY `ok` result
+  list DOES cache — "nobody has ever submitted these bytes" is the content
+  evidence a re-tune would otherwise pay the API again to re-derive. The `client`
+  key stays OUT of the identity (it only spends quota), so rotating the key does
+  not invalidate every answer on disk.
+- MusicBrainz / archive.org: only HTTP 200 bodies. 4xx/5xx — including the 429
+  that a self-inflicted burst produces — cache nothing, so a run that hit the
+  rate limit re-asks instead of trusting an error page for 72 hours.
+- nzb.life: only a body `_nzb_get` actually RETURNED. It raises after 429/5xx
+  backoff, and raises AT ONCE on the 24h per-release "Already Downloaded" cooldown
+  429, so a WAF block, a cooldown or a dead gateway publishes nothing; a real
+  zero-item newznab page is an answer ("no release carries this query") and DOES
+  cache, for the listing TTL only.
+- yt-dlp listings (`sources._yt_search` — the SoundCloud `scsearch` listing, plus the
+  YouTube `ytsearch` / `ytsearch_loose` listings whenever those two sources are
+  re-enabled, since `SOURCES` currently ships them commented out): only non-empty
+  stdout from a ZERO-EXIT yt-dlp. A non-zero run (age-gated video, dead session,
+  rate limit) is a FAILED listing, not an empty one, and publishes nothing —
+  freezing its empty stdout would cache "no such uploads" for the whole TTL. The
+  cookie jar's own mtime is part of the key, so a rotated jar refreshes the store
+  instead of serving a ranking a dead session produced. A yt-dlp **media** download
+  (`_download_yt`) is deliberately NOT cached here — it is the fetch, and its bytes
+  go to `sources/` like every other source file.
+- LLM: only a non-empty reply. A failed call publishes nothing, so a GPU that was
+  mid-reload does not freeze its half-answer for a week.
+
+A hit whose payload will not parse is treated as a damaged entry, not an answer:
+the caller logs it, `lookups.drop_key`s it and returns "no answer", so the NEXT
+call re-fetches instead of trusting the same bytes forever.
+
+`cached(kind, key_parts, fetch, log, source=, sub=)` is the only entry point
+(`(hit, payload)`); `lookups.cached("search", …)` on the *search* kinds must
+receive a `log` that is not `print` where the caller has one, or every store miss
+echoes its `http N` note onto a job's log tail (the tuner reads that tail as the
+user-visible progress line).
+
+Spacing interaction, MusicBrainz: the reply cache short-circuits **before**
+`MB_MIN_INTERVAL`, not after. The 1 s gate exists to keep real requests off
+MusicBrainz's published budget, and a cache hit is no request at all — so a tune
+whose album + `cd_year` + duration answers are all on disk takes zero seconds of
+forced sleep, while genuine misses are still spaced and retried exactly as before.
 
 ## Fingerprint re-verification (2026-11-11)
 The AcoustID gate used to run only on fresh downloads, so it had three
