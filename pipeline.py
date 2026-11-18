@@ -8,6 +8,7 @@ Stages:
   4. transcode  ffmpeg -> MP3 160 kbps CBR / 44.1 kHz / stereo
   5. name       "ARTIST - TITLE (YEAR).mp3", output re-verified against spec
 """
+import collections
 import difflib
 import hashlib
 import json
@@ -1889,6 +1890,9 @@ NZB_MAX_ARCHIVE = (int(os.environ.get("TUNESTER_NZB_MAX_ARCHIVE_MB", "1024"))
 # a tracklist sidecar is fetched only for a release with no media file that
 # names the song.
 NZB_COMP_CHECKS = int(os.environ.get("TUNESTER_NZB_COMP_CHECKS", "24"))
+# Final fallback (cache sweep) read cap: manifests are small, local and
+# already on disk, so the sweep is bounded by disk reads, not API calls.
+NZB_CACHE_READS = int(os.environ.get("TUNESTER_NZB_CACHE_READS", "4000"))
 # Text tracklists that name a release's tracks when its media file names do
 # not: hash-volume comp boxes posted as `...::HASH::/...` whose every part
 # decodes to `(1/1)`. A scene `.m3u`/`.cue`/`.foc` lists `NN - Title`.
@@ -1896,10 +1900,42 @@ NZB_SIDECAR_EXTS = ("m3u", "m3u8", "cue", "foc", "m3l", "txt", "nfo", "log")
 NZB_SIDE_MAX = 512 * 1024  # a bigger sidecar is not a plain tracklist
 
 
+# Usenet scaffolding that is never part of a file name: the part counter
+# and yEnc banner a subject ends with, the brand tags (`[N3wZ]`, `[PRiVATE]`)
+# and the obfuscation prefix (`\HASH\::`, `::/path/`, `HASH::/path/`) it
+# starts with. Stripped only by the tier-3 fallback below, never from a name
+# a stronger tier already produced.
+_SUBJ_TAIL = re.compile(r"\s*(?:\(\d+/\d+\)|\[\d+\s*/\s*\d+\]|yEnc(?:\s+\d+)?|-\s*-?)\s*$",
+                       re.I)
+_SUBJ_HEAD = re.compile(
+    r"^\s*(?:\[[^\]]{0,40}\]|<[^\s>]{0,40}>|"
+    r"\\\\?[A-Za-z0-9]{4,24}\\\\?::|::(?:/[^\s/]+)+/?"
+    r"|[A-Za-z0-9]{12,64}::(?:/[^\s/]+)*/?)[\s-]*")
+_EXT_TAIL = re.compile(r"\.[A-Za-z0-9]{2,5}$")
+# A bare extension (".nzb", ".par2") is not a name; a name needs a stem.
+_STEM_EXT = re.compile(r"[^\s./]\.[A-Za-z0-9]{2,5}$")
+
+
 def _nzb_file_name(subject: str) -> str:
-    """Best-effort media file name from a part subject: a quoted
-    filename, the longest (possibly nested) bracketed tag ending in a
-    file extension, or the last token."""
+    r"""Best-effort media file name from a part subject, strongest shape first:
+      1. a quoted filename (`"03 - Song.flac"`);
+      2. the longest (possibly nested) bracketed tag ending in a file
+         extension - the shape
+         `[PRiVATE]-[EnCrYpTnZb]-[NN-artist-title-grp.mp3]-[33/36] - "" yEnc
+         ...` hides the real name in, because the quoted slot is left empty
+         on purpose;
+      3. the subject with its Usenet scaffolding peeled off (trailing part
+         counter / yEnc banner, leading brand tag and `\HASH\::` / `::/path/`
+         obfuscation prefix, `::/seg/seg` segments inside the name), accepted
+         ONLY when what survives ends in a real file extension - the shape
+         `\[N3wZ] \VWNgWR378528\::Metallica - Kill 'em All [1983-Flac 24Bit
+         96Khz]04 - Jump In The Fire.flac (1/298)` and `David Bowie - Let's
+         Dance (1983) - [03/17] - 01 Modern Love.flac (1/52)` hide the name
+         in, and both used to distill to the meaningless part counter
+         `(1/298)` / `(1/52)`, which made the whole release look like it had
+         no files at all;
+      4. the last token, as before.
+    """
     m = re.search(r'"([^"]+?\.[a-z0-9]{2,5})"', subject, re.I)
     if m:
         return m.group(1)
@@ -1917,10 +1953,26 @@ def _nzb_file_name(subject: str) -> str:
         if depth:
             continue
         g = subject[i + 1:j - 1]
-        if re.search(r"\.[a-z0-9]{2,5}$", g, re.I) and len(g) > len(best):
+        if _EXT_TAIL.search(g) and len(g) > len(best):
             best = g
     if best:
         return best
+    # Tier 3: peel the scaffolding, take the remainder when it is a name.
+    t = subject
+    while True:
+        m = _SUBJ_TAIL.search(t)
+        if not m or m.start() == 0:
+            break
+        t = t[:m.start()]
+    while True:
+        m = _SUBJ_HEAD.match(t)
+        if not m or not m.end():
+            break
+        t = t[m.end():]
+    t = re.sub(r"::(?:/[^\s/]+)+/?", " ", t)  # hash path inside the name
+    t = t.replace('"', "").strip()  # any quote left here is scaffolding
+    if _STEM_EXT.search(t):
+        return t
     parts = subject.split()
     return parts[-1] if parts else "file"
 
@@ -2451,6 +2503,174 @@ def _nzb_comp_cands(target: Target, tried: set[str], log) -> list[Candidate]:
                              bool(target.album) and _norm(target.album)
                              in _norm(h[1].title), -h[1].posted), reverse=True)
     return [c for _t, c in hits]
+
+
+def _nzb_release_name(manifest: bytes, files) -> tuple[str, str]:
+    r"""(release name, poster) that a manifest implies, for a release whose
+    nzb.life search entry we never had - the cache sweep has only the NZB.
+    The API's `<meta type="name">` when the NZB carries it (the NZB providers
+    that post scene releases do); else the bracketed scene-style tag the
+    subjects share (`[ System_Of_A_Down-Toxicity-2001-HiTS_iNT ]`); else the
+    scaffolding-free text the subjects share (`David Bowie - Let's Dance
+    (1983) - `, `\[N3wZ] \HASH\::Various Artists - Billboard Top Hits- 1982
+    - Toto - `), which is how those posters encode the release. "" when the
+    files share nothing - a hash-volume box posted file-by-file with no
+    common header, where only the file names carry meaning."""
+    name = ""
+    poster = ""
+    try:
+        root = ET.fromstring(manifest)
+        for me in root.findall(f"{NZB_NS}head/{NZB_NS}meta"):
+            if (me.get("type") or "").lower() == "name":
+                name = (me.text or "").strip()
+                break
+        for fe in root.findall(f"{NZB_NS}file"):
+            if fe.get("poster"):
+                poster = fe.get("poster")
+                break
+    except ET.ParseError:
+        pass
+    if name:
+        return name.replace(".", " ").strip(), poster
+    tags: list[str] = []
+    heads: list[str] = []
+    for subj, _grp, _segs in files:
+        for m in re.finditer(r"\[\s*([^\]\[]{6,120}?)\s*\]", subj):
+            g = m.group(1)
+            # A scene release tag: hyphen-separated fields naming the
+            # release (`System_Of_A_Down-Toxicity-2001-HiTS_iNT`). Reject
+            # the spec tags that share the shape (`[1983-Flac 24Bit 96Khz]`,
+            # `[96-24]`) - they start with digits and name nothing.
+            if ("-" in g and not _EXT_TAIL.search(g) and "/" not in g
+                    and g[:1].isalpha()):
+                tags.append(g)
+        i = subj.find('"')
+        j = subj.lower().find("yenc")
+        head = subj[:i if i > 0 else (j if j > 0 else len(subj))]
+        head = re.sub(r"\[\s*\d+\s*/\s*\d+\s*\]", "", head)
+        while True:  # peel each poster's obfuscation prefix first
+            m = _SUBJ_HEAD.match(head)
+            if not m or not m.end():
+                break
+            head = head[m.end():]
+        while True:  # and its trailing part counter (`... .flac (1/298)`)
+            m = _SUBJ_TAIL.search(head)
+            if not m or m.start() == 0:
+                break
+            head = head[:m.start()]
+        head = head.strip(" -")
+        if len(head) >= 12:
+            heads.append(head)
+    if tags:
+        top = collections.Counter(tags).most_common(1)[0][0]
+        return top.replace("_", " ").strip(), poster
+    if heads:
+        # Every file of a release shares the release name: the longest
+        # common prefix of the subjects IS that name, up to where the
+        # per-file names start diverging.
+        top = heads[0]
+        for h in heads[1:]:
+            k = 0
+            while k < min(len(top), len(h)) and top[k] == h[k]:
+                k += 1
+            top = top[:k]
+        top = top.strip(" -_")
+        if len(top) >= 8:
+            return top, poster
+    return "", poster
+
+
+def _nzb_cached_cands(target: Target, tried: set[str],
+                     log) -> list[Candidate]:
+    r"""Final fallback: sweep the persistent NZB manifest CACHE - every
+    release this box has ever fetched, not just the ones the API will
+    surface for this song's name or album - and admit the ones whose file
+    names carry the song. The layers above can only judge releases a
+    search returned, and nzb.life's search matches the RELEASE TITLE, so a
+    release whose title names neither the song nor its album is invisible
+    to them; the obfuscated posters are worse, since until `_nzb_file_name`
+    learned the `\HASH\::Artist - Album - Track.flac` and bare-`01 Modern
+    Love.flac (1/52)` shapes their whole file list distilled to part
+    counters and the release looked empty. The manifest is already on disk
+    and judging it costs no API call.
+
+    Admission is by CONTENT, and it is strict:
+      * a media file in the manifest must name the song at a `_title_hit`
+        tier (exact title, or the parenthetical-stripped form) and survive
+        the censored/altered filter - the same test the album pluck applies;
+      * the artist must appear in that file name OR in the release name the
+        manifest implies, so a VA box's `13 - Don't You Want Me.flac` (Human
+        League) is not admitted for Human League's neighbour's song.
+    Nothing is relaxed after admission: every hit goes back through
+    `_try_candidates`, which runs the probe, the MusicBrainz length anchor,
+    the AcoustID attribution/live veto and the LLM version gate exactly as
+    written. A release that only LOOKS right by name dies there, so this
+    layer widens what the gates get to judge; it never weakens them."""
+    d = Path(os.environ.get("TUNESTER_NZB_CACHE", "/data/.nzb-cache"))
+    try:
+        names = sorted(d.glob("*.nzb"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    if not names:
+        return []
+    bad = make_bad_filter(target.artist)
+    artist = _norm(target.artist)
+    hits: list[tuple[tuple[int, int, int, int, float], Candidate]] = []
+    seen: set[str] = {u for u in tried}
+    read = 0
+    for cp in names[:NZB_CACHE_READS]:
+        url = cp.stem
+        if not re.fullmatch(r"[0-9a-fA-F]{8,64}", url) or url in seen:
+            continue
+        read += 1
+        try:
+            manifest = cp.read_bytes()
+        except OSError:
+            continue
+        files = _nzb_release_files(manifest)
+        if not files:
+            continue
+        found = _nzb_album_file(manifest, target, bad)
+        if not found:
+            continue
+        fname, tier = found
+        rname, poster = _nzb_release_name(manifest, files)
+        if rname and bad(rname):
+            continue
+        # Artist attribution: the file name (scene names carry it:
+        # `17-oingo_boingo-goodbye-goodbye.flac`) or the release name
+        # (`[ Oingo_Boingo-Best_O_Boingo-CD-FLAC-1991-FORSAKEN ]`).
+        if artist not in _norm(fname) and artist not in _norm(rname):
+            continue
+        posted = 0.0
+        try:
+            root = ET.fromstring(manifest)
+            dates = [int(fe.get("date") or 0) for fe in root.findall(f"{NZB_NS}file")]
+            posted = min([x for x in dates if x] or [0])
+        except (ET.ParseError, ValueError):
+            pass
+        seen.add(url)
+        log(f"      cache sweep: {fname!r} names the song in "
+            f"{(rname or fname)!r} [{tier}]")
+        cand = Candidate(source="nzb", url=url, title=rname or fname,
+                         uploader=poster, posted=float(posted),
+                         release=rname)
+        rank = (tier,
+                bool(target.album) and _norm(target.album) in _norm(rname),
+                _norm(target.album) in _norm(fname) if target.album else 0,
+                "flac" in (rname + fname).lower()
+                or "wav" in (rname + fname).lower(),
+                -posted)
+        hits.append((rank, cand))
+    if not hits:
+        log(f"      cache sweep: no cached release named the song "
+            f"({read} manifest(s) read)")
+        return []
+    hits.sort(key=lambda h: h[0], reverse=True)
+    log(f"      cache sweep: {len(hits)} cached release(s) name the song "
+        f"({read} manifest(s) read)")
+    return [c for _r, c in hits]
 
 
 def _download_nzb(cand: Candidate, tmp: Path, target: Target,
@@ -3308,6 +3528,17 @@ def tune(raw: str, opts: Options | None = None, llm: LLM | None = None,
                 "compilation that contains the song")
             comp = _nzb_comp_cands(target, tried, log)
             got = _try_candidates(comp[:TRIALS_PER_SOURCE], tmp, cookies,
+                                  target, llm, opts, dst, log, tried)
+            if got is not None:
+                return got
+            # The artist browse reaches only releases nzb.life indexes under
+            # the artist's own name. Final layer: sweep the manifest cache -
+            # every release this box has ever fetched - for file names that
+            # carry the song, and let the gates judge them.
+            log("[2/5] final fallback: sweeping the cached NZB manifests "
+                "for a release whose file names carry the song")
+            swept = _nzb_cached_cands(target, tried, log)
+            got = _try_candidates(swept[:TRIALS_PER_SOURCE], tmp, cookies,
                                   target, llm, opts, dst, log, tried)
             if got is not None:
                 return got

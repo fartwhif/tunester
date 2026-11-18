@@ -626,6 +626,60 @@ so the scan never re-fetches one. A confident match is a *verified file*,
 not a title that looked right: the first name match does not end the search,
 the first gate-passing delivery does.
 
+## Final fallback: the cached-manifest sweep (`_nzb_cached_cands`, 2026-11-18)
+The operator's case was `Oingo Boingo - Goodbye Goodbye`: the only copy this
+box had ever fetched is posted as
+`[PRiVATE]-[EnCrYpTnZb]-[29-oingo_boingo-goodbye-goodbye-marr.mp3]-[33/36] - ""
+yEnc 9180638 (1/13)` — a 33rd-of-36 file of a batch, the real name hidden in a
+bracketed tag because the quoted slot is deliberately empty, `marr` the ripper
+tag, 9,180,638 B in 13 yEnc parts. Its manifest sits in the persistent NZB
+cache (`4121af92d150cd78…nzb`), but no layer could see it: **nzb.life search
+matches the RELEASE TITLE**, and that release's title names neither the song
+nor its album, so the search stages, the album pluck and the artist browse all
+missed it. When the higher layers skip a cached release because the fingerprint
+looked wrong, that skip is *correct* — this layer does not override it, it only
+makes the release visible to the same checks.
+
+**Two halves, both needed.**
+1. `_nzb_file_name` gained a **tier 3**: strip the Usenet scaffolding (trailing
+   part counter / yEnc banner / `- -`, leading brand tag `<x>`, `[N3wZ]` or
+   `\HASH\::` / `::/path/` / `HASH::/path/` obfuscation prefix, `::/seg/seg`
+   segments inside the name) and take the remainder **only if it ends in a real
+   extension with a stem**. Measured over this box's cache (2,515 manifests,
+   45,188 part subjects): **249 subjects changed distillation**, e.g.
+   `[N3wZ] \0RL42Q378528\::Various Artists - Entertainment Weekly Greatest Hits
+   - 1982 - Toto - Rosanna.flac yEnc (1/105)` used to distill to `(1/105)` and
+   `David Bowie - Let's Dance (1983) - [03/17] - 01 Modern Love.flac (1/52)` to
+   `(1/52)` — i.e. those releases looked like they had **no files at all**, so
+   not just names but whole releases were invisible. 3,671 part-counter
+   distillations remain and that is right: they are the hash-volume boxes whose
+   audio lives inside the RAR (the tier-1 sidecar path above).
+2. After the compilation scan, `tune` sweeps **every cached manifest** (newest
+   first, cap `TUNESTER_NZB_CACHE_READS`, default 4000 — local small files, so
+   disk reads, not API calls) and admits a release when a **media file names the
+   song at a `_title_hit` tier** (`_nzb_album_file`, the album pluck's own test)
+   **and** the artist appears in that file name or in the release name the
+   manifest implies (`_nzb_release_name`: the API `<meta type="name">`, else the
+   bracketed scene tag the subjects share, else the scaffolding-free longest
+   common prefix — the shape `David Bowie - Let's Dance (1983) - ` and
+   `\[N3wZ] \HASH\::Various Artists - Billboard Top Hits- 1982 - Toto - ` use).
+   The artist test is what keeps a VA box's `13 - Don't You Want Me.flac` from
+   being offered for a neighbour's song. On the live cache the sweep admits 6
+   releases for Goodbye Goodbye: the three obfuscated single-file postings plus
+   `Best O' Boingo` (FLAC) and two `Boingo Alive` boxes, ranked lossless-first
+   then oldest-posting, album-titled above the VA-shaped ones.
+
+**Nothing is relaxed after admission.** Every hit goes back through
+`_try_candidates` — probe, MusicBrainz length anchor, AcoustID attribution +
+live veto, LLM version gate, transcode, output re-verify — so a release that
+only *looks* right by name dies exactly where it did before. The layer widens
+what the gates judge; it never weakens them. The hub repo's `platform/tests/
+test_tunester_cache_sweep.py` (26 tests) locks the parser tiers against real
+posted subjects, the VA non-admissions, the ranking, the uploader/date
+provenance, and a `tune`-level run with every network primitive poisoned
+proving both that a swept release is gate-decided (no delivery) and that the
+sweep is what turns a gate-passing cached release into one.
+
 ## Usenet curation pitfalls (names are false fronts)
 - 12" maxis are named after the A-side: `Beck-Loser-VLS-FLAC-1994-ERP`
   contains `b1-beck-alcohol.flac` and `b2-beck-fume.flac` with ID3s
